@@ -1,0 +1,6 @@
+outs:
+- md5: dc5c13f7f4192d8d91abb1bfda214a51.dir
+  size: 21850497
+  nfiles: 2
+  hash: md5
+  path: demo_session2
