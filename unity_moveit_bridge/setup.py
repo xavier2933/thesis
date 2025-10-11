@@ -11,6 +11,8 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/unity_full_demo.launch.py']),
+        ('share/' + package_name + '/launch', ['launch/arm_launch.launch.py']),
+
     ],
     install_requires=['setuptools'],
     zip_safe=True,

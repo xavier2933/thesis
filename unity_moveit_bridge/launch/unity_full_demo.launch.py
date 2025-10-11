@@ -17,7 +17,10 @@ def generate_launch_description():
                 "launch",
                 "demo.launch.py",
             ])
-        )
+        ),
+        launch_arguments={
+            'use_rviz': 'false'
+        }.items()
     )
 
     # ROS–Unity TCP endpoint
