@@ -23,7 +23,8 @@ class UnityMoveItTrajectoryBridge(Node):
         # Subscriber to Unity target poses
         self.subscription = self.create_subscription(
             Pose,
-            '/unity_target_pose',
+            # '/unity_target_pose',
+            '/target_pose',
             self.pose_callback,
             10
         )

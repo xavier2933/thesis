@@ -23,6 +23,7 @@ setup(
         'console_scripts': [
             'unity_goal_to_moveit = unity_moveit_bridge.unity_goal_to_moveit:main',
             'unity_target_pubsub = unity_moveit_bridge.unity_target_pubsub:main',
+            'control_arbitrator = unity_moveit_bridge.control_arbitrator:main'
         ],
     },
 )

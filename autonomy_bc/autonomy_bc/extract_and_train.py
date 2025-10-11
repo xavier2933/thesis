@@ -152,26 +152,9 @@ class BehaviorCloningModel(nn.Module):
     def forward(self, x):
         return self.network(x)
 
-def train_behavior_cloning(episodes, model_save_path="robot_bc_model.pth"):
+def train_behavior_cloning(states, actions, episodes, model_save_path="robot_bc_model.pth"):
     """Train behavior cloning model"""
-    
-    # Prepare training data
-    states = []
-    actions = []
-    
-    for episode in episodes:
-        for step in episode:
-            # State: current joint positions (7 values)
-            state = step['current_joints']
-            # Action: target end-effector pose (7 values: x,y,z,qx,qy,qz,qw)  
-            action = step['target_pose']
-            
-            states.append(state)
-            actions.append(action)
-    
-    states = np.array(states, dtype=np.float32)
-    actions = np.array(actions, dtype=np.float32)
-    
+
     print(f"Training data: {states.shape[0]} samples")
     print(f"State shape: {states.shape[1]}, Action shape: {actions.shape[1]}")
     
@@ -264,6 +247,50 @@ def train_behavior_cloning(episodes, model_save_path="robot_bc_model.pth"):
     
     return model, state_scaler, action_scaler
 
+def load_all_data(episodes_from_bag, dagger_data_dir='../data'):
+    """Combine original bag episodes with DAgger sessions"""
+    from pathlib import Path
+    import glob
+    
+    # Start with original episodes
+    all_states = []
+    all_actions = []
+    
+    # Convert bag episodes to state-action pairs
+    for episode in episodes_from_bag:
+        for step in episode:
+            all_states.append(step['current_joints'])
+            all_actions.append(step['target_pose'])
+    
+    original_count = len(all_states)
+    
+    # Load all DAgger sessions
+    dagger_dir = Path(dagger_data_dir)
+    dagger_files = sorted(dagger_dir.glob('dagger_session_*.pkl'))
+    
+    if dagger_files:
+        print(f"\nFound {len(dagger_files)} DAgger session files")
+        
+        for dagger_file in dagger_files:
+            with open(dagger_file, 'rb') as f:
+                dagger_data = pickle.load(f)
+            
+            print(f"  Loading {dagger_file.name}: {len(dagger_data)} samples")
+            
+            for sample in dagger_data:
+                all_states.append(sample['state'])
+                all_actions.append(sample['action'])
+        
+        dagger_count = len(all_states) - original_count
+        print(f"\nTotal samples: {len(all_states)}")
+        print(f"  - Original (from bag): {original_count}")
+        print(f"  - DAgger interventions: {dagger_count}")
+        print(f"  - DAgger percentage: {100 * dagger_count / len(all_states):.1f}%")
+    else:
+        print("\nNo DAgger sessions found - training on bag data only")
+    
+    return np.array(all_states, dtype=np.float32), np.array(all_actions, dtype=np.float32)
+
 def main():
     print("=== BEHAVIOR CLONING PIPELINE ===")
     
@@ -272,35 +299,17 @@ def main():
     print(f"1. Extracting demonstrations from: {bag_path}")
     extractor = TrajectoryExtractor(bag_path)
     episodes = extractor.extract_from_bag()
-    
-    if len(episodes) == 0:
-        print("❌ No episodes found! Check your bag file and reset detection.")
-        print("\nDebugging tips:")
-        print("- Make sure your bag contains /unity_target_pose and /joint_states topics")
-        print("- Check if you pressed 'R' to create resets during recording")
-        print("- Try reducing the reset detection threshold (currently 0.3m)")
-        return
-    
-    print(f"\n2. Successfully extracted {len(episodes)} episodes")
-    print("📁 Check these files for inspection:")
-    print("   - extracted_trajectories.json (detailed data)")
-    print("   - trajectory_summary.txt (statistics)")  
-    print("   - trajectory_visualization.png (plots)")
-    
-    # Ask user if they want to continue
-    response = input(f"\n3. Ready to train on {sum(len(ep) for ep in episodes)} data points? (y/n): ")
-    
-    if response.lower() != 'y':
-        print("Training cancelled. Check the extracted data and run again.")
-        return
-    
-    # Train model
-    print("\n4. Training behavior cloning model...")
-    model, state_scaler, action_scaler = train_behavior_cloning(episodes)
-    print("✅ Training complete!")
-    
-    print(f"\n5. Model saved as: robot_bc_model.pth")
-    print("🚀 You can now run: python bc_controller.py")
+
+    states, actions = load_all_data(
+        episodes_from_bag=episodes,
+        dagger_data_dir='../data'  # Adjust path as needed
+    )
+
+    train_behavior_cloning(
+        states=states,
+        actions=actions,
+        model_save_path="robot_bc_model.pth"
+    )
 
 if __name__ == "__main__":
     main()

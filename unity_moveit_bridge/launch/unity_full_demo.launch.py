@@ -34,8 +34,15 @@ def generate_launch_description():
         output="screen"
     )
 
+    control_arbitrator = Node(
+        package="unity_moveit_bridge",
+        executable="control_arbitrator",
+        output="screen"
+    )
+
     return LaunchDescription([
         moveit_demo,
         tcp_endpoint,
-        unity_bridge
+        unity_bridge,
+        control_arbitrator
     ])

@@ -6,6 +6,7 @@ Subscribes to joint states, predicts target poses, and publishes them to unity_t
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool
 from geometry_msgs.msg import Pose
 import torch
 import torch.nn as nn
@@ -52,14 +53,14 @@ class BCController(Node):
         
         self.pose_pub = self.create_publisher(
             Pose,
-            '/unity_target_pose',
+            '/bc_target_pose',
             10
         )
         
         # Control parameters
         self.current_joints = None
         self.last_prediction = None
-        self.prediction_threshold = 0.01  # Only publish if prediction changed significantly
+        self.prediction_threshold = 0.0001  # Only publish if prediction changed significantly
         self.control_rate = 10.0  # Hz
         
         # Create timer for periodic control
@@ -69,16 +70,17 @@ class BCController(Node):
         )
         
         # Control flags
-        self.autonomous_mode = False
+        self.autonomous_mode = True
         
         self.get_logger().info('BC Controller started. Press Ctrl+C to stop.')
         self.get_logger().info('Send "start" or "stop" commands to /bc_commands topic to control autonomous mode.')
         
-        # Optional: command subscriber to start/stop autonomous control
-        self.command_sub = self.create_subscription(
-            JointState,  # We'll use empty JointState as a trigger, or you can use String
-            '/bc_commands',
-            self.command_callback,
+
+        self.is_expert_active = False
+        self.expert_active_sub = self.create_subscription(
+            Bool,
+            '/is_expert_active',
+            self.is_expert_active_callback,
             10
         )
     
@@ -118,6 +120,9 @@ class BCController(Node):
             self.current_joints = np.array(msg.position[:7], dtype=np.float32)
         else:
             self.get_logger().warn(f"Received joint state with {len(msg.position)} joints, expected 7+")
+
+    def is_expert_active_callback(self, msg):
+        self.is_expert_active = msg
     
     def predict_target_pose(self, joint_positions):
         """Use trained model to predict target end-effector pose"""
@@ -172,18 +177,10 @@ class BCController(Node):
             self.last_prediction = predicted_pose.copy()
             
             # Debug info
-            self.get_logger().debug(f'Published target: ({predicted_pose[0]:.3f}, {predicted_pose[1]:.3f}, {predicted_pose[2]:.3f})')
+            self.get_logger().info(f'Published target: ({predicted_pose[0]:.3f}, {predicted_pose[1]:.3f}, {predicted_pose[2]:.3f})')
             
         except Exception as e:
             self.get_logger().error(f'Error in control loop: {str(e)}')
-    
-    def command_callback(self, msg):
-        """Handle start/stop commands"""
-        # Simple command handling - you can improve this
-        # For now, any message toggles autonomous mode
-        self.autonomous_mode = not self.autonomous_mode
-        status = "STARTED" if self.autonomous_mode else "STOPPED"
-        self.get_logger().info(f'Autonomous control {status}')
     
     def start_autonomous(self):
         """Start autonomous control"""
@@ -207,7 +204,6 @@ def main(args=None):
         # Create controller node
         controller = BCController(model_path=model_path)
         
-        # Start autonomous control immediately (or wait for command)
         print("\n=== BC Controller Ready ===")
         print("Commands:")
         print("  - The robot will start in STOPPED mode")
@@ -217,7 +213,6 @@ def main(args=None):
         print("\nTo start immediately, uncomment the line below:")
         print("# controller.start_autonomous()")
         
-        # Uncomment this line to start autonomous control immediately:
         controller.start_autonomous()
         
         # Spin the node
