@@ -13,7 +13,7 @@ def generate_launch_description():
     moveit_demo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
-                get_package_share_directory("moveit_resources_panda_moveit_config"),
+                get_package_share_directory("panda_scaled_moveit_config"),
                 "launch",
                 "demo.launch.py",
             ])

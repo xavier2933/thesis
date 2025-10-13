@@ -42,12 +42,12 @@ class UnityMoveItBridge(Node):
 
         # Build MoveGroup goal
         move_goal = MoveGroup.Goal()
-        move_goal.request.workspace_parameters.min_corner.x = -1.0
-        move_goal.request.workspace_parameters.min_corner.y = -1.0
+        move_goal.request.workspace_parameters.min_corner.x = -1.9
+        move_goal.request.workspace_parameters.min_corner.y = -1.9
         move_goal.request.workspace_parameters.min_corner.z = 0.0
-        move_goal.request.workspace_parameters.max_corner.x = 1.0
-        move_goal.request.workspace_parameters.max_corner.y = 1.0
-        move_goal.request.workspace_parameters.max_corner.z = 1.5
+        move_goal.request.workspace_parameters.max_corner.x = 1.9
+        move_goal.request.workspace_parameters.max_corner.y = 1.9
+        move_goal.request.workspace_parameters.max_corner.z = 2.85  # 1.5 * 1.9
         move_goal.request.start_state.is_diff = True
         move_goal.request.goal_constraints.append(
             MoveGroup.Goal().request.goal_constraints[0]  # placeholder for now

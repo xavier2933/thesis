@@ -111,7 +111,7 @@ class ControlArbitrator(Node):
                 'action': self._pose_to_array(self.unity_pose)  # Expert's commanded pose
             }
             self.dagger_buffer.append(sample)
-            self.get_logger().info(f'Collected sample {len(self.dagger_buffer)}')
+            # self.get_logger().info(f'Collected sample {len(self.dagger_buffer)}')
 
     def publish_expert_status(self, is_active):
         """Publish expert status and handle data saving"""

@@ -72,7 +72,7 @@ class UnityMoveItTrajectoryBridge(Node):
             dx = pose_msg.position.x - self.last_pose.position.x
             dy = pose_msg.position.y - self.last_pose.position.y
             dz = pose_msg.position.z - self.last_pose.position.z
-            if dx*dx + dy*dy + dz*dz < 0.0004:  # ~2 cm threshold
+            if dx*dx + dy*dy + dz*dz < 0.00144:  # ~2 cm threshold
                 return
 
         self.last_pose = copy.deepcopy(pose_msg)
@@ -87,7 +87,7 @@ class UnityMoveItTrajectoryBridge(Node):
         # Call IK service
         ik_req = GetPositionIK.Request()
         ik_req.ik_request.group_name = self.group_name
-        ik_req.ik_request.pose_stamped.header.frame_id = "panda_link0"
+        ik_req.ik_request.pose_stamped.header.frame_id = "world"
 
         safe_pose = Pose()
         safe_pose.position.x = ros_x
