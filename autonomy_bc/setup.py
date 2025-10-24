@@ -24,6 +24,7 @@ setup(
         'console_scripts': [
             'extract_trajectories = autonomy_bc.extract_and_train:main',
             'bc_controller = autonomy_bc.bc_controller:main',
+            'dumb_alg = autonomy_bc.dumb_alg:main',
         ],
     },
 )
