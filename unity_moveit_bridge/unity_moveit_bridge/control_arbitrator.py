@@ -67,10 +67,10 @@ class ControlArbitrator(Node):
         self.dagger_session_number = self._get_next_session_number()
         
         # Timer for data collection
-        self.collection_timer = self.create_timer(
-            1.0 / self.collection_rate,
-            self.collection_callback
-        )
+        # self.collection_timer = self.create_timer(
+        #     1.0 / self.collection_rate,
+        #     self.collection_callback
+        # )
 
         self.expert_timeout = 2.0  # seconds
         self.last_unity_msg_time = None
