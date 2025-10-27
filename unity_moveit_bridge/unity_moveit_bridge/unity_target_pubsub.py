@@ -9,6 +9,7 @@ from std_msgs.msg import Header, Bool
 import copy
 from rclpy.action import ActionClient
 from control_msgs.action import GripperCommand
+import math
 
 
 class UnityMoveItTrajectoryBridge(Node):
@@ -85,15 +86,35 @@ class UnityMoveItTrajectoryBridge(Node):
         self.arm_pub.publish(traj)
         self.get_logger().info("♻️ Arm reset command executed")
 
-    # ---------------------------------------------------
-    # 🤖 Handle target poses from Unity (for arm motion)
-    # ---------------------------------------------------
+    def quat_to_euler(self, x, y, z, w):
+        """Convert quaternion to euler angles (roll, pitch, yaw) in degrees"""
+        # Roll (x-axis rotation)
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        roll = math.atan2(sinr_cosp, cosr_cosp)
+
+        # Pitch (y-axis rotation)
+        sinp = 2 * (w * y - z * x)
+        if abs(sinp) >= 1:
+            pitch = math.copysign(math.pi / 2, sinp)
+        else:
+            pitch = math.asin(sinp)
+
+        # Yaw (z-axis rotation)
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
+
+
     def pose_callback(self, pose_msg: Pose):
+        
         if self.last_pose:
             dx = pose_msg.position.x - self.last_pose.position.x
             dy = pose_msg.position.y - self.last_pose.position.y
             dz = pose_msg.position.z - self.last_pose.position.z
-            if dx * dx + dy * dy + dz * dz < 0.00144:  # 2 cm threshold
+            if dx * dx + dy * dy + dz * dz < 0.0001:  # 2 cm threshold
                 return
         self.last_pose = copy.deepcopy(pose_msg)
 
@@ -101,6 +122,14 @@ class UnityMoveItTrajectoryBridge(Node):
         ros_x = pose_msg.position.z
         ros_y = -pose_msg.position.x
         ros_z = pose_msg.position.y
+
+        # --- Convert orientation from Unity to ROS ---
+        # Unity uses left-handed coordinates, ROS uses right-handed
+        # This conversion depends on your Unity's coordinate frame setup
+        ros_quat_x = 0.7071068
+        ros_quat_y = -0.7071068
+        ros_quat_z = 0.0
+        ros_quat_w = 0.0
 
         ik_req = GetPositionIK.Request()
         ik_req.ik_request.group_name = self.group_name
@@ -110,7 +139,13 @@ class UnityMoveItTrajectoryBridge(Node):
         safe_pose.position.x = ros_x
         safe_pose.position.y = ros_y
         safe_pose.position.z = ros_z
-        safe_pose.orientation.w = 1.0  # neutral orientation
+        
+        # Use the actual orientation from Unity instead of neutral
+        safe_pose.orientation.x = ros_quat_x
+        safe_pose.orientation.y = ros_quat_y
+        safe_pose.orientation.z = ros_quat_z
+        safe_pose.orientation.w = ros_quat_w
+        
         ik_req.ik_request.pose_stamped.pose = safe_pose
         ik_req.ik_request.timeout.sec = 1
         ik_req.ik_request.avoid_collisions = True
