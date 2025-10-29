@@ -53,6 +53,14 @@ class ControlArbitrator(Node):
             '/target_pose',
             10
         )
+
+        self.autonomous_mode = False
+        self.mode_sub = self.create_subscription(
+            Bool,
+            '/autonomous_mode',
+            self.mode_callback,
+            10
+        )
         # For DAgger data collection:
         self.dagger_buffer = []
         self.collection_rate = 10.0  # Hz
@@ -78,20 +86,34 @@ class ControlArbitrator(Node):
         # Timer to check for expert timeout
         self.timeout_timer = self.create_timer(0.1, self.check_expert_timeout)
 
+    def mode_callback(self, msg):
+        """Enable/disable autonomous mode (ignores Unity during autonomous)"""
+        self.autonomous_mode = msg.data
+        if msg.data:
+            self.get_logger().info('🤖 Autonomous mode enabled - ignoring Unity')
+            self.publish_expert_status(False)
+        else:
+            self.get_logger().info('👤 Manual mode enabled - Unity can override')
+
     def bc_pose_callback(self, msg):
         self.bc_pose = msg
         self.get_logger().info('received bc pose')
 
         if not self.is_expert_active:
             self.publish_goal_pose(msg)
+            self.get_logger().info("from bc")
         else:
             self.get_logger().info("Expert active, passing")
             pass
 
     def unity_pose_callback(self, msg):
+        # Skip Unity messages during autonomous mode
+        if self.autonomous_mode:
+            return
+            
         self.unity_pose = msg
         self.last_unity_msg_time = self.get_clock().now()
-
+        
         self.publish_goal_pose(msg)
         if not self.is_expert_active:
             self.publish_expert_status(True)

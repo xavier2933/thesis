@@ -5,11 +5,15 @@ from geometry_msgs.msg import Pose
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from moveit_msgs.srv import GetPositionIK
-from std_msgs.msg import Header, Bool
+from std_msgs.msg import Header, Bool, Float32
 import copy
 from rclpy.action import ActionClient
 from control_msgs.action import GripperCommand
 import math
+import numpy as np
+if not hasattr(np, 'float'):
+    np.float = float  # temporary patch for old packages
+from tf_transformations import quaternion_multiply, quaternion_from_euler
 
 
 class UnityMoveItTrajectoryBridge(Node):
@@ -28,6 +32,14 @@ class UnityMoveItTrajectoryBridge(Node):
         self.gripper_client = ActionClient(self, GripperCommand, '/panda_hand_controller/gripper_cmd')
 
         # --- Subscriptions ---
+        self.wristAngle = 0.0
+        self.wrist_sub = self.create_subscription(
+            Float32,
+            '/wrist_angle',
+            self.wrist_callback,
+            10
+        )
+
         self.pose_sub = self.create_subscription(
             Pose,
             '/target_pose',
@@ -62,6 +74,9 @@ class UnityMoveItTrajectoryBridge(Node):
             10
         )
 
+
+
+
         # --- IK Service ---
         self.ik_client = self.create_client(GetPositionIK, '/compute_ik')
         while not self.ik_client.wait_for_service(timeout_sec=1):
@@ -86,36 +101,35 @@ class UnityMoveItTrajectoryBridge(Node):
         self.arm_pub.publish(traj)
         self.get_logger().info("♻️ Arm reset command executed")
 
-    def quat_to_euler(self, x, y, z, w):
-        """Convert quaternion to euler angles (roll, pitch, yaw) in degrees"""
-        # Roll (x-axis rotation)
-        sinr_cosp = 2 * (w * x + y * z)
-        cosr_cosp = 1 - 2 * (x * x + y * y)
-        roll = math.atan2(sinr_cosp, cosr_cosp)
 
-        # Pitch (y-axis rotation)
-        sinp = 2 * (w * y - z * x)
-        if abs(sinp) >= 1:
-            pitch = math.copysign(math.pi / 2, sinp)
-        else:
-            pitch = math.asin(sinp)
-
-        # Yaw (z-axis rotation)
-        siny_cosp = 2 * (w * z + x * y)
-        cosy_cosp = 1 - 2 * (y * y + z * z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
-
-        return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
+    def wrist_callback(self, msg: Float32):
+        self.wristAngle = msg.data
+        self.get_logger().info(f"Received wrist angle = {msg.data}")
 
 
     def pose_callback(self, pose_msg: Pose):
         
-        if self.last_pose:
-            dx = pose_msg.position.x - self.last_pose.position.x
-            dy = pose_msg.position.y - self.last_pose.position.y
-            dz = pose_msg.position.z - self.last_pose.position.z
-            if dx * dx + dy * dy + dz * dz < 0.0001:  # 2 cm threshold
-                return
+        # if self.last_pose:
+        #     # --- Position difference ---
+        #     dx = pose_msg.position.x - self.last_pose.position.x
+        #     dy = pose_msg.position.y - self.last_pose.position.y
+        #     dz = pose_msg.position.z - self.last_pose.position.z
+        #     pos_diff_sq = dx * dx + dy * dy + dz * dz
+
+        #     # --- Orientation difference (angular distance in radians) ---
+        #     q1 = pose_msg.orientation
+        #     q2 = self.last_pose.orientation
+        #     dot = q1.x * q2.x + q1.y * q2.y + q1.z * q2.z + q1.w * q2.w
+        #     dot = max(min(dot, 1.0), -1.0)  # numerical safety
+        #     angle_diff = 2 * math.acos(abs(dot))  # radians
+
+        #     # --- Thresholds ---
+        #     pos_threshold_sq = 0.0001       # ≈ 1 cm^2 (adjust as needed)
+        #     angle_threshold = math.radians(2.0)  # ≈ 2 degrees
+
+        #     if pos_diff_sq < pos_threshold_sq and angle_diff < angle_threshold:
+        #         return
+
         self.last_pose = copy.deepcopy(pose_msg)
 
         # --- Unity → ROS coordinate conversion ---
@@ -126,10 +140,16 @@ class UnityMoveItTrajectoryBridge(Node):
         # --- Convert orientation from Unity to ROS ---
         # Unity uses left-handed coordinates, ROS uses right-handed
         # This conversion depends on your Unity's coordinate frame setup
-        ros_quat_x = 0.7071068
-        ros_quat_y = -0.7071068
-        ros_quat_z = 0.0
-        ros_quat_w = 0.0
+        # --- Convert quaternion from Unity (left-handed) to ROS (right-handed) ---
+        base_down_q = np.array([0.7071068, -0.7071068, 0.0, 0.0])  # [x, y, z, w]
+        q = quaternion_from_euler(0,0, math.radians(self.wristAngle))
+        final_q = quaternion_multiply(q, base_down_q)
+
+        ros_quat_x = pose_msg.orientation.z
+        ros_quat_y = -pose_msg.orientation.x
+        ros_quat_z = pose_msg.orientation.y
+        ros_quat_w = pose_msg.orientation.w
+
 
         ik_req = GetPositionIK.Request()
         ik_req.ik_request.group_name = self.group_name
@@ -141,10 +161,10 @@ class UnityMoveItTrajectoryBridge(Node):
         safe_pose.position.z = ros_z
         
         # Use the actual orientation from Unity instead of neutral
-        safe_pose.orientation.x = ros_quat_x
-        safe_pose.orientation.y = ros_quat_y
-        safe_pose.orientation.z = ros_quat_z
-        safe_pose.orientation.w = ros_quat_w
+        safe_pose.orientation.x = final_q[0]
+        safe_pose.orientation.y = final_q[1]
+        safe_pose.orientation.z = final_q[2]
+        safe_pose.orientation.w = final_q[3]
         
         ik_req.ik_request.pose_stamped.pose = safe_pose
         ik_req.ik_request.timeout.sec = 1
@@ -184,7 +204,7 @@ class UnityMoveItTrajectoryBridge(Node):
     # ---------------------------------------------------
     def gripper_callback(self, msg: Bool):
         open_gripper = msg.data
-        position = 0.04 if open_gripper else 0.0  # open ≈ 4cm, closed ≈ 0cm
+        position = 0.08 if open_gripper else 0.0  # open ≈ 4cm, closed ≈ 0cm
         max_effort = 2.0
 
         # Build the goal
