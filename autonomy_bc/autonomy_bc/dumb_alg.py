@@ -17,10 +17,8 @@ class DumbAlg(Node):
         self.wrist_angle_pub = self.create_publisher(Float32, '/wrist_angle', 10)
         self.gripper_pub = self.create_publisher(Bool, '/gripper_command', 10)
         
-        # Publisher to control autonomous mode
         self.autonomous_mode_pub = self.create_publisher(Bool, '/autonomous_mode', 10)
 
-        # Subscribe to joint states to monitor arm motion
         self.joint_states_sub = self.create_subscription(
             JointState,
             '/joint_states',
@@ -199,15 +197,6 @@ class DumbAlg(Node):
             if not self.move_arm_to_pose(x=0.3315790891647339, y=0.49157944321632385, z=0.33947375416755676, wrist_angle=46.0):
                 self.get_logger().error("❌ Failed to lower arm")
                 return
-
-
-            # --- Run behavior cloning (lower, grasp, lift) ---
-            # self.get_logger().info("🎯 Step 4: Running BC to grasp antenna...")
-            # self.run_bc(duration=5.0)
-            
-            # # --- Move to a safe position ---
-            # self.get_logger().info("📦 Step 5: Moving to safe position...")
-            # self.move_arm_to_pose(x=0.5, y=0.0, z=0.5, wrist_angle=0.0)
             
             self.get_logger().info("✅ Sequence complete!")
             
