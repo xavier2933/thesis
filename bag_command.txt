@@ -1,0 +1,10 @@
+ros2 bag record \
+  /unity_target_pose \
+  /wrist_angle \
+  /gripper_command \
+  /joint_states \
+  /panda_arm_controller/state \
+  /block_pose \
+  /tf /tf_static \
+  /contact_detected
+
