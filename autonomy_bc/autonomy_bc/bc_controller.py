@@ -19,7 +19,7 @@ import os
 
 
 class BehaviorCloningModel(nn.Module):
-    """Neural network model for behavior cloning (same as training script)"""
+    
     def __init__(self, state_dim=7, action_dim=7, hidden_dim=256):
         super().__init__()
         self.network = nn.Sequential(
@@ -40,10 +40,8 @@ class BCController(Node):
     def __init__(self, model_path="robot_bc_model.pth"):
         super().__init__('bc_controller')
         
-        # Load trained model
         self.load_model(model_path)
         
-        # ROS2 setup
         self.joint_sub = self.create_subscription(
             JointState,
             '/joint_states',
@@ -57,19 +55,16 @@ class BCController(Node):
             10
         )
         
-        # Control parameters
         self.current_joints = None
         self.last_prediction = None
         self.prediction_threshold = 0.0001  # Only publish if prediction changed significantly
         self.control_rate = 10.0  # Hz
         
-        # Create timer for periodic control
         self.control_timer = self.create_timer(
             1.0 / self.control_rate,
             self.control_callback
         )
         
-        # Control flags
         self.autonomous_mode = True
         
         self.get_logger().info('BC Controller started. Press Ctrl+C to stop.')
@@ -85,7 +80,7 @@ class BCController(Node):
         )
     
     def load_model(self, model_path):
-        """Load the trained behavior cloning model and scalers"""
+
         model_file = Path(model_path)
         
         if not model_file.exists():
@@ -102,11 +97,9 @@ class BCController(Node):
             action_dim=config['action_dim']
         )   
         
-        # Load trained weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.eval()  # Set to evaluation mode
+        self.model.eval()
         
-        # Load scalers
         self.state_scaler = checkpoint['state_scaler']
         self.action_scaler = checkpoint['action_scaler']
         
@@ -114,8 +107,7 @@ class BCController(Node):
         self.get_logger().info(f'State dim: {config["state_dim"]}, Action dim: {config["action_dim"]}')
     
     def joint_callback(self, msg):
-        """Callback for joint state updates"""
-        # Extract first 7 joint positions (Panda arm joints)
+        
         if len(msg.position) >= 7:
             self.current_joints = np.array(msg.position[:7], dtype=np.float32)
         else:
@@ -125,8 +117,7 @@ class BCController(Node):
         self.is_expert_active = msg
     
     def predict_target_pose(self, joint_positions):
-        """Use trained model to predict target end-effector pose"""
-        # Normalize input using saved scaler
+        
         joints_normalized = self.state_scaler.transform(joint_positions.reshape(1, -1))
         
         # Predict with model
@@ -134,13 +125,12 @@ class BCController(Node):
             joints_tensor = torch.FloatTensor(joints_normalized)
             prediction = self.model(joints_tensor).numpy()
         
-        # Denormalize output
         target_pose = self.action_scaler.inverse_transform(prediction)[0]
         
         return target_pose  # [x, y, z, qx, qy, qz, qw]
     
     def control_callback(self):
-        """Main control loop - runs at fixed rate"""
+
         if not self.autonomous_mode:
             return
             
@@ -149,34 +139,28 @@ class BCController(Node):
             return
         
         try:
-            # Get prediction from model
             predicted_pose = self.predict_target_pose(self.current_joints)
             
-            # Check if prediction changed significantly
             if self.last_prediction is not None:
                 pose_diff = np.linalg.norm(predicted_pose[:3] - self.last_prediction[:3])
                 if pose_diff < self.prediction_threshold:
-                    return  # Skip publishing if change is too small
+                    return  
             
-            # Create and publish Pose message
             pose_msg = Pose()
             
-            # Position
             pose_msg.position.x = float(predicted_pose[0])
             pose_msg.position.y = float(predicted_pose[1])
             pose_msg.position.z = float(predicted_pose[2])
             
-            # Orientation (quaternion)
+            ############## TODO MAKE THIS USE THE SAME GRIPPER DOWN ORIENTATION
             pose_msg.orientation.x = float(predicted_pose[3])
             pose_msg.orientation.y = float(predicted_pose[4])
             pose_msg.orientation.z = float(predicted_pose[5])
             pose_msg.orientation.w = float(predicted_pose[6])
             
-            # Publish
             self.pose_pub.publish(pose_msg)
             self.last_prediction = predicted_pose.copy()
             
-            # Debug info
             self.get_logger().info(f'Published target: ({predicted_pose[0]:.3f}, {predicted_pose[1]:.3f}, {predicted_pose[2]:.3f})')
             
         except Exception as e:
@@ -201,7 +185,6 @@ def main(args=None):
 
     
     try:
-        # Create controller node
         controller = BCController(model_path=model_path)
         
         print("\n=== BC Controller Ready ===")
@@ -215,7 +198,6 @@ def main(args=None):
         
         controller.start_autonomous()
         
-        # Spin the node
         rclpy.spin(controller)
         
     except KeyboardInterrupt:
