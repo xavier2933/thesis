@@ -6,5 +6,7 @@ ros2 bag record \
   /panda_arm_controller/state \
   /block_pose \
   /tf /tf_static \
-  /contact_detected
+  /left_contact_detected \
+  /right_contact_detected
+
 
