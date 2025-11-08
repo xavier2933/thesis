@@ -20,7 +20,6 @@ class UnityMoveItTrajectoryBridge(Node):
     def __init__(self):
         super().__init__('unity_moveit_trajectory_bridge')
 
-        # --- MoveIt Parameters ---
         self.group_name = "panda_arm"
         self.end_effector_link = "panda_hand"
         self.joint_names = [
@@ -31,7 +30,6 @@ class UnityMoveItTrajectoryBridge(Node):
 
         self.gripper_client = ActionClient(self, GripperCommand, '/panda_hand_controller/gripper_cmd')
 
-        # --- Subscriptions ---
         self.wristAngle = 0.0
         self.wrist_sub = self.create_subscription(
             Float32,
@@ -61,7 +59,6 @@ class UnityMoveItTrajectoryBridge(Node):
             10
         )
 
-        # --- Publishers ---
         self.arm_pub = self.create_publisher(
             JointTrajectory,
             'panda_arm_controller/joint_trajectory',
@@ -74,10 +71,6 @@ class UnityMoveItTrajectoryBridge(Node):
             10
         )
 
-
-
-
-        # --- IK Service ---
         self.ik_client = self.create_client(GetPositionIK, '/compute_ik')
         while not self.ik_client.wait_for_service(timeout_sec=1):
             self.get_logger().info("⏳ Waiting for IK service...")
@@ -85,9 +78,8 @@ class UnityMoveItTrajectoryBridge(Node):
         self.last_pose = None
         self.get_logger().info("✅ Unity → MoveIt trajectory bridge started.")
 
-    # ---------------------------------------------------
-    # 🦾 Reset the arm to a known joint configuration
-    # ---------------------------------------------------
+
+    # Reset to position for IL training
     def reset_callback(self, msg):
         traj = JointTrajectory()
         traj.joint_names = list(msg.name)
@@ -108,27 +100,6 @@ class UnityMoveItTrajectoryBridge(Node):
 
 
     def pose_callback(self, pose_msg: Pose):
-        
-        # if self.last_pose:
-        #     # --- Position difference ---
-        #     dx = pose_msg.position.x - self.last_pose.position.x
-        #     dy = pose_msg.position.y - self.last_pose.position.y
-        #     dz = pose_msg.position.z - self.last_pose.position.z
-        #     pos_diff_sq = dx * dx + dy * dy + dz * dz
-
-        #     # --- Orientation difference (angular distance in radians) ---
-        #     q1 = pose_msg.orientation
-        #     q2 = self.last_pose.orientation
-        #     dot = q1.x * q2.x + q1.y * q2.y + q1.z * q2.z + q1.w * q2.w
-        #     dot = max(min(dot, 1.0), -1.0)  # numerical safety
-        #     angle_diff = 2 * math.acos(abs(dot))  # radians
-
-        #     # --- Thresholds ---
-        #     pos_threshold_sq = 0.0001       # ≈ 1 cm^2 (adjust as needed)
-        #     angle_threshold = math.radians(2.0)  # ≈ 2 degrees
-
-        #     if pos_diff_sq < pos_threshold_sq and angle_diff < angle_threshold:
-        #         return
 
         self.last_pose = copy.deepcopy(pose_msg)
 
@@ -137,11 +108,7 @@ class UnityMoveItTrajectoryBridge(Node):
         ros_y = -pose_msg.position.x
         ros_z = pose_msg.position.y
 
-        # --- Convert orientation from Unity to ROS ---
-        # Unity uses left-handed coordinates, ROS uses right-handed
-        # This conversion depends on your Unity's coordinate frame setup
-        # --- Convert quaternion from Unity (left-handed) to ROS (right-handed) ---
-        base_down_q = np.array([0.7071068, -0.7071068, 0.0, 0.0])  # [x, y, z, w]
+        base_down_q = np.array([0.7071068, -0.7071068, 0.0, 0.0])
         q = quaternion_from_euler(0,0, math.radians(self.wristAngle))
         final_q = quaternion_multiply(q, base_down_q)
 
@@ -173,9 +140,7 @@ class UnityMoveItTrajectoryBridge(Node):
         future = self.ik_client.call_async(ik_req)
         future.add_done_callback(self.ik_response_callback)
 
-    # ---------------------------------------------------
-    # 🧠 Handle IK response (for arm trajectory)
-    # ---------------------------------------------------
+
     def ik_response_callback(self, future):
         try:
             response = future.result()
@@ -199,25 +164,20 @@ class UnityMoveItTrajectoryBridge(Node):
         except Exception as e:
             self.get_logger().error(f"IK service call failed: {e}")
 
-    # ---------------------------------------------------
-    # ✋ Handle gripper open/close commands
-    # ---------------------------------------------------
+
     def gripper_callback(self, msg: Bool):
         open_gripper = msg.data
-        position = 0.08 if open_gripper else 0.0  # open ≈ 4cm, closed ≈ 0cm
+        position = 0.08 if open_gripper else 0.0  # 0 < open < 0.9???
         max_effort = 2.0
 
-        # Build the goal
         goal_msg = GripperCommand.Goal()
         goal_msg.command.position = position
         goal_msg.command.max_effort = max_effort
 
-        # Wait until the action server is ready
         if not self.gripper_client.wait_for_server(timeout_sec=1.0):
             self.get_logger().warn("Gripper action server not available!")
             return
 
-        # Send goal asynchronously
         self.gripper_client.send_goal_async(goal_msg)
         self.get_logger().info(f"🖐️ Gripper {'opened' if open_gripper else 'closed'}")
 
