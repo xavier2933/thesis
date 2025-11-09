@@ -153,7 +153,6 @@ class ControlArbitrator(Node):
 
     def publish_goal_pose(self, msg):
         self.target_pose_pub.publish(msg)
-        self.get_logger().info('Published goal pose to /target_pose')
 
     def _get_next_session_number(self):
         """Find the next available session number"""

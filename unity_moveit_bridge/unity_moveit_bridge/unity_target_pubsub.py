@@ -28,6 +28,14 @@ class UnityMoveItTrajectoryBridge(Node):
             "panda_joint7"
         ]
 
+        self.last_pose = None
+        self.last_joint_positions = None
+        self.pose_tolerance = 1e-3      # meters
+        self.orientation_tolerance = 1e-2  # quaternion difference
+        self.movement_tolerance = 1e-3  # radians for joint comparison
+        self.last_gripper_position = None
+        self.position_tolerance = 1e-3 # gripper
+
         self.gripper_client = ActionClient(self, GripperCommand, '/panda_hand_controller/gripper_cmd')
 
         self.wristAngle = 0.0
@@ -96,49 +104,57 @@ class UnityMoveItTrajectoryBridge(Node):
 
     def wrist_callback(self, msg: Float32):
         self.wristAngle = msg.data
-        self.get_logger().info(f"Received wrist angle = {msg.data}")
 
 
     def pose_callback(self, pose_msg: Pose):
-
-        self.last_pose = copy.deepcopy(pose_msg)
-
         # --- Unity → ROS coordinate conversion ---
         ros_x = pose_msg.position.z
         ros_y = -pose_msg.position.x
         ros_z = pose_msg.position.y
 
         base_down_q = np.array([0.7071068, -0.7071068, 0.0, 0.0])
-        q = quaternion_from_euler(0,0, math.radians(self.wristAngle))
+        q = quaternion_from_euler(0, 0, math.radians(self.wristAngle))
         final_q = quaternion_multiply(q, base_down_q)
-
-        ros_quat_x = pose_msg.orientation.z
-        ros_quat_y = -pose_msg.orientation.x
-        ros_quat_z = pose_msg.orientation.y
-        ros_quat_w = pose_msg.orientation.w
-
-
-        ik_req = GetPositionIK.Request()
-        ik_req.ik_request.group_name = self.group_name
-        ik_req.ik_request.pose_stamped.header.frame_id = "world"
 
         safe_pose = Pose()
         safe_pose.position.x = ros_x
         safe_pose.position.y = ros_y
         safe_pose.position.z = ros_z
-        
-        # Use the actual orientation from Unity instead of neutral
         safe_pose.orientation.x = final_q[0]
         safe_pose.orientation.y = final_q[1]
         safe_pose.orientation.z = final_q[2]
         safe_pose.orientation.w = final_q[3]
-        
+
+        # --- Skip IK if pose hasn't changed significantly ---
+        if self.last_pose is not None:
+            pos_diff = np.array([
+                abs(safe_pose.position.x - self.last_pose.position.x),
+                abs(safe_pose.position.y - self.last_pose.position.y),
+                abs(safe_pose.position.z - self.last_pose.position.z)
+            ])
+            ori_diff = np.abs(np.array([
+                safe_pose.orientation.x - self.last_pose.orientation.x,
+                safe_pose.orientation.y - self.last_pose.orientation.y,
+                safe_pose.orientation.z - self.last_pose.orientation.z,
+                safe_pose.orientation.w - self.last_pose.orientation.w
+            ]))
+            if np.all(pos_diff < self.pose_tolerance) and np.all(ori_diff < self.orientation_tolerance):
+                self.get_logger().debug("⏸️ Skipping IK request: pose unchanged.")
+                return
+
+        self.last_pose = copy.deepcopy(safe_pose)
+
+        # --- Call IK only if pose changed ---
+        ik_req = GetPositionIK.Request()
+        ik_req.ik_request.group_name = self.group_name
+        ik_req.ik_request.pose_stamped.header.frame_id = "world"
         ik_req.ik_request.pose_stamped.pose = safe_pose
         ik_req.ik_request.timeout.sec = 1
         ik_req.ik_request.avoid_collisions = True
 
         future = self.ik_client.call_async(ik_req)
         future.add_done_callback(self.ik_response_callback)
+
 
 
     def ik_response_callback(self, future):
@@ -167,18 +183,25 @@ class UnityMoveItTrajectoryBridge(Node):
 
     def gripper_callback(self, msg: Bool):
         open_gripper = msg.data
-        position = 0.08 if open_gripper else 0.0  # 0 < open < 0.9???
+        position = 0.08 if open_gripper else 0.0  # open vs closed position
         max_effort = 2.0
+
+        # --- Skip if same as last command ---
+        if self.last_gripper_position is not None:
+            if abs(position - self.last_gripper_position) < self.position_tolerance:
+                self.get_logger().debug("⏸️ Skipping redundant gripper command.")
+                return
+
+        if not self.gripper_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().warn("⚠️ Gripper action server not available!")
+            return
 
         goal_msg = GripperCommand.Goal()
         goal_msg.command.position = position
         goal_msg.command.max_effort = max_effort
 
-        if not self.gripper_client.wait_for_server(timeout_sec=1.0):
-            self.get_logger().warn("Gripper action server not available!")
-            return
-
         self.gripper_client.send_goal_async(goal_msg)
+        self.last_gripper_position = position
         self.get_logger().info(f"🖐️ Gripper {'opened' if open_gripper else 'closed'}")
 
 
