@@ -15,7 +15,7 @@ class DumbAlg(Node):
         self.move_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.target_pose_pub = self.create_publisher(Pose, '/target_pose', 10)
         self.wrist_angle_pub = self.create_publisher(Float32, '/wrist_angle', 10)
-        self.gripper_pub = self.create_publisher(Bool, '/gripper_command', 10)
+        self.gripper_pub = self.create_publisher(Bool, '/gripper_cmd_aut', 10)
         
         self.autonomous_mode_pub = self.create_publisher(Bool, '/autonomous_mode', 10)
 

@@ -15,6 +15,10 @@ if not hasattr(np, 'float'):
     np.float = float  # temporary patch for old packages
 from tf_transformations import quaternion_multiply, quaternion_from_euler
 
+"""
+TODO: Move gripper command logic to control arbitrator
+"""
+
 
 class UnityMoveItTrajectoryBridge(Node):
     def __init__(self):
@@ -63,7 +67,14 @@ class UnityMoveItTrajectoryBridge(Node):
         self.gripper_sub = self.create_subscription(
             Bool,
             '/gripper_command',
-            self.gripper_callback,
+            self.gripper_callback_manual,
+            10
+        )
+
+        self.gripper_aut_sub = self.create_subscription(
+            Bool, 
+            '/gripper_cmd_aut', 
+            self.gripper_callback_autonomous, 
             10
         )
 
@@ -78,6 +89,11 @@ class UnityMoveItTrajectoryBridge(Node):
             'panda_hand_controller/joint_trajectory',
             10
         )
+
+        self.autonomous_mode = False  # <--- track current control mode
+        self.mode_sub = self.create_subscription(Bool, '/autonomous_mode', self.mode_callback, 10)
+
+
 
         self.ik_client = self.create_client(GetPositionIK, '/compute_ik')
         while not self.ik_client.wait_for_service(timeout_sec=1):
@@ -180,13 +196,31 @@ class UnityMoveItTrajectoryBridge(Node):
         except Exception as e:
             self.get_logger().error(f"IK service call failed: {e}")
 
+    def mode_callback(self, msg: Bool):
+        self.autonomous_mode = msg.data
+        mode = "AUTONOMOUS" if msg.data else "MANUAL"
+        self.get_logger().info(f"🔄 Control mode switched to: {mode}")
 
-    def gripper_callback(self, msg: Bool):
-        open_gripper = msg.data
-        position = 0.08 if open_gripper else 0.0  # open vs closed position
+    def gripper_callback_manual(self, msg: Bool):
+        if self.autonomous_mode:
+            self.get_logger().debug("🚫 Ignoring manual gripper command (autonomous mode active).")
+            return
+        self._execute_gripper_command(msg.data)
+
+
+    # === Autonomous gripper control ===
+    def gripper_callback_autonomous(self, msg: Bool):
+        if not self.autonomous_mode:
+            self.get_logger().debug("🚫 Ignoring autonomous gripper command (manual mode active).")
+            return
+        self._execute_gripper_command(msg.data)
+
+
+    # === Gripper execution helper ===
+    def _execute_gripper_command(self, open_gripper: bool):
+        position = 0.08 if open_gripper else 0.0
         max_effort = 2.0
 
-        # --- Skip if same as last command ---
         if self.last_gripper_position is not None:
             if abs(position - self.last_gripper_position) < self.position_tolerance:
                 self.get_logger().debug("⏸️ Skipping redundant gripper command.")
