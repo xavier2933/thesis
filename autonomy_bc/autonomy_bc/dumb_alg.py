@@ -194,7 +194,7 @@ class DumbAlg(Node):
             self.control_gripper(open_gripper=True)
 
             self.get_logger().info("📍 Step 3: Lowering arm...")
-            if not self.move_arm_to_pose(x=0.3315790891647339, y=0.49157944321632385, z=0.33947375416755676, wrist_angle=46.0):
+            if not self.move_arm_to_pose(x=0.3315790891647339, y=0.49157944321632385, z=0.4, wrist_angle=46.0):
                 self.get_logger().error("❌ Failed to lower arm")
                 return
             
