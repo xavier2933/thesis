@@ -73,14 +73,7 @@ class ControlArbitrator(Node):
         
         self.get_logger().info(f'DAgger data will be saved to: {self.data_dir}')
         
-        # Find next available file number
         self.dagger_session_number = self._get_next_session_number()
-        
-        # Timer for data collection
-        # self.collection_timer = self.create_timer(
-        #     1.0 / self.collection_rate,
-        #     self.collection_callback
-        # )
 
         self.expert_timeout = 2.0  # seconds
         self.last_unity_msg_time = None
@@ -109,7 +102,6 @@ class ControlArbitrator(Node):
             pass
 
     def unity_pose_callback(self, msg):
-        # Skip Unity messages during autonomous mode
         if self.autonomous_mode:
             return
             
@@ -135,7 +127,6 @@ class ControlArbitrator(Node):
                 'action': self._pose_to_array(self.unity_pose)  # Expert's commanded pose
             }
             self.dagger_buffer.append(sample)
-            # self.get_logger().info(f'Collected sample {len(self.dagger_buffer)}')
 
     def publish_expert_status(self, is_active):
         """Publish expert status and handle data saving"""
