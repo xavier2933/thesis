@@ -12,12 +12,8 @@ from control_msgs.action import GripperCommand
 import math
 import numpy as np
 if not hasattr(np, 'float'):
-    np.float = float  # temporary patch for old packages
+    np.float = float
 from tf_transformations import quaternion_multiply, quaternion_from_euler
-
-"""
-TODO: Move gripper command logic to control arbitrator
-"""
 
 
 class UnityMoveItTrajectoryBridge(Node):
@@ -34,11 +30,11 @@ class UnityMoveItTrajectoryBridge(Node):
 
         self.last_pose = None
         self.last_joint_positions = None
-        self.pose_tolerance = 1e-3      # meters
-        self.orientation_tolerance = 1e-2  # quaternion difference
-        self.movement_tolerance = 1e-3  # radians for joint comparison
+        self.pose_tolerance = 1e-3
+        self.orientation_tolerance = 1e-2
+        self.movement_tolerance = 1e-3
         self.last_gripper_position = None
-        self.position_tolerance = 1e-3 # gripper
+        self.position_tolerance = 1e-3
 
         self.gripper_client = ActionClient(self, GripperCommand, '/panda_hand_controller/gripper_cmd')
 
@@ -50,6 +46,7 @@ class UnityMoveItTrajectoryBridge(Node):
             10
         )
 
+        # Subscribe to the arbitrated target pose
         self.pose_sub = self.create_subscription(
             Pose,
             '/target_pose',
@@ -90,10 +87,8 @@ class UnityMoveItTrajectoryBridge(Node):
             10
         )
 
-        self.autonomous_mode = False  # <--- track current control mode
+        self.autonomous_mode = False
         self.mode_sub = self.create_subscription(Bool, '/autonomous_mode', self.mode_callback, 10)
-
-
 
         self.ik_client = self.create_client(GetPositionIK, '/compute_ik')
         while not self.ik_client.wait_for_service(timeout_sec=1):
@@ -102,8 +97,6 @@ class UnityMoveItTrajectoryBridge(Node):
         self.last_pose = None
         self.get_logger().info("✅ Unity → MoveIt trajectory bridge started.")
 
-
-    # Reset to position for IL training
     def reset_callback(self, msg):
         traj = JointTrajectory()
         traj.joint_names = list(msg.name)
@@ -117,13 +110,17 @@ class UnityMoveItTrajectoryBridge(Node):
         self.arm_pub.publish(traj)
         self.get_logger().info("♻️ Arm reset command executed")
 
-
     def wrist_callback(self, msg: Float32):
-        self.wristAngle = msg.data
-
+        # Only update wrist angle from manual control (Unity)
+        if not self.autonomous_mode:
+            self.wristAngle = msg.data
 
     def pose_callback(self, pose_msg: Pose):
-        # --- Unity → ROS coordinate conversion ---
+        """
+        Process target pose from either Unity or Dreamer.
+        - Unity poses need coordinate transformation
+        - Dreamer poses are already in ROS frame
+        """
         ros_x = pose_msg.position.z
         ros_y = -pose_msg.position.x
         ros_z = pose_msg.position.y
@@ -140,8 +137,9 @@ class UnityMoveItTrajectoryBridge(Node):
         safe_pose.orientation.y = final_q[1]
         safe_pose.orientation.z = final_q[2]
         safe_pose.orientation.w = final_q[3]
+        self.get_logger().debug("👤 Processing Unity pose (transformed to ROS frame)")
 
-        # --- Skip IK if pose hasn't changed significantly ---
+        # Skip IK if pose hasn't changed significantly
         if self.last_pose is not None:
             pos_diff = np.array([
                 abs(safe_pose.position.x - self.last_pose.position.x),
@@ -160,7 +158,7 @@ class UnityMoveItTrajectoryBridge(Node):
 
         self.last_pose = copy.deepcopy(safe_pose)
 
-        # --- Call IK only if pose changed ---
+        # Call IK
         ik_req = GetPositionIK.Request()
         ik_req.ik_request.group_name = self.group_name
         ik_req.ik_request.pose_stamped.header.frame_id = "world"
@@ -170,8 +168,6 @@ class UnityMoveItTrajectoryBridge(Node):
 
         future = self.ik_client.call_async(ik_req)
         future.add_done_callback(self.ik_response_callback)
-
-
 
     def ik_response_callback(self, future):
         try:
@@ -191,14 +187,15 @@ class UnityMoveItTrajectoryBridge(Node):
 
             traj.header.stamp = self.get_clock().now().to_msg()
             self.arm_pub.publish(traj)
-            self.get_logger().info(f"📤 Published arm trajectory: {joint_positions}")
+            mode = "DREAMER" if self.autonomous_mode else "UNITY"
+            self.get_logger().info(f"📤 [{mode}] Published arm trajectory")
 
         except Exception as e:
             self.get_logger().error(f"IK service call failed: {e}")
 
     def mode_callback(self, msg: Bool):
         self.autonomous_mode = msg.data
-        mode = "AUTONOMOUS" if msg.data else "MANUAL"
+        mode = "AUTONOMOUS (Dreamer)" if msg.data else "MANUAL (Unity)"
         self.get_logger().info(f"🔄 Control mode switched to: {mode}")
 
     def gripper_callback_manual(self, msg: Bool):
@@ -207,16 +204,12 @@ class UnityMoveItTrajectoryBridge(Node):
             return
         self._execute_gripper_command(msg.data)
 
-
-    # === Autonomous gripper control ===
     def gripper_callback_autonomous(self, msg: Bool):
         if not self.autonomous_mode:
             self.get_logger().debug("🚫 Ignoring autonomous gripper command (manual mode active).")
             return
         self._execute_gripper_command(msg.data)
 
-
-    # === Gripper execution helper ===
     def _execute_gripper_command(self, open_gripper: bool):
         position = 0.08 if open_gripper else 0.0
         max_effort = 2.0
@@ -236,8 +229,8 @@ class UnityMoveItTrajectoryBridge(Node):
 
         self.gripper_client.send_goal_async(goal_msg)
         self.last_gripper_position = position
-        self.get_logger().info(f"🖐️ Gripper {'opened' if open_gripper else 'closed'}")
-
+        mode = "DREAMER" if self.autonomous_mode else "UNITY"
+        self.get_logger().info(f"🖐️ [{mode}] Gripper {'opened' if open_gripper else 'closed'}")
 
 
 def main(args=None):
