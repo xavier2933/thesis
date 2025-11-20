@@ -36,7 +36,6 @@ class DumbAlg(Node):
     def joint_states_callback(self, msg: JointState):
         """Track current joint velocities."""
         if self.arm_joint_indices is None:
-            # Find indices of panda arm joints
             self.arm_joint_indices = []
             for joint_name in ["panda_joint1", "panda_joint2", "panda_joint3",
                               "panda_joint4", "panda_joint5", "panda_joint6",
@@ -47,7 +46,6 @@ class DumbAlg(Node):
         if len(msg.velocity) > 0:
             self.current_joint_velocities = [msg.velocity[i] for i in self.arm_joint_indices 
                                             if i < len(msg.velocity)]
-            # Debug logging
             max_vel = max(abs(v) for v in self.current_joint_velocities)
             if max_vel > 0.001:  # Only log if there's significant movement
                 self.get_logger().debug(f"Joint velocities - max: {max_vel:.4f}")
