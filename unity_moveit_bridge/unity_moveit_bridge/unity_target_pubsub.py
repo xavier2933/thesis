@@ -46,6 +46,13 @@ class UnityMoveItTrajectoryBridge(Node):
             10
         )
 
+        self.bc_wrist_sub = self.create_subscription(
+            Float32,
+            '/bc_wrist_angle',
+            self.bc_wrist_callback,
+            10
+        )
+
         # Subscribe to the arbitrated target pose
         self.pose_sub = self.create_subscription(
             Pose,
@@ -113,6 +120,10 @@ class UnityMoveItTrajectoryBridge(Node):
     def wrist_callback(self, msg: Float32):
         # Only update wrist angle from manual control (Unity)
         if not self.autonomous_mode:
+            self.wristAngle = msg.data
+
+    def bc_wrist_callback(self, msg: Float32):
+        if self.autonomous_mode:
             self.wristAngle = msg.data
 
     def pose_callback(self, pose_msg: Pose):
