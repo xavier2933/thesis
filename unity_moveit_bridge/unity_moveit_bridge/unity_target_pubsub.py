@@ -14,6 +14,8 @@ import numpy as np
 if not hasattr(np, 'float'):
     np.float = float
 from tf_transformations import quaternion_multiply, quaternion_from_euler
+import tf2_ros
+from geometry_msgs.msg import TransformStamped
 
 
 class UnityMoveItTrajectoryBridge(Node):
@@ -102,6 +104,21 @@ class UnityMoveItTrajectoryBridge(Node):
             self.get_logger().info("⏳ Waiting for IK service...")
 
         self.last_pose = None
+
+        # TF Buffer and Listener
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # Publisher for actual end effector pose
+        self.actual_pose_pub = self.create_publisher(
+            Pose,
+            '/actual_end_effector_pose',
+            10
+        )
+
+        # Timer for publishing actual pose
+        self.create_timer(0.1, self.publish_actual_pose)
+
         self.get_logger().info("✅ Unity → MoveIt trajectory bridge started.")
 
     def reset_callback(self, msg):
@@ -242,6 +259,31 @@ class UnityMoveItTrajectoryBridge(Node):
         self.last_gripper_position = position
         mode = "DREAMER" if self.autonomous_mode else "UNITY"
         self.get_logger().info(f"🖐️ [{mode}] Gripper {'opened' if open_gripper else 'closed'}")
+
+    def publish_actual_pose(self):
+        try:
+            # Look up transform from world to panda_hand
+            t = self.tf_buffer.lookup_transform(
+                'world',
+                self.end_effector_link,
+                rclpy.time.Time()
+            )
+
+            pose_msg = Pose()
+            pose_msg.position.x = t.transform.translation.x
+            pose_msg.position.y = t.transform.translation.y
+            pose_msg.position.z = t.transform.translation.z
+            pose_msg.orientation.x = t.transform.rotation.x
+            pose_msg.orientation.y = t.transform.rotation.y
+            pose_msg.orientation.z = t.transform.rotation.z
+            pose_msg.orientation.w = t.transform.rotation.w
+
+            self.actual_pose_pub.publish(pose_msg)
+            # self.get_logger().debug("Published actual end effector pose")
+
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            # self.get_logger().warn(f"Could not transform {self.end_effector_link} to world: {e}")
+            pass
 
 
 def main(args=None):
