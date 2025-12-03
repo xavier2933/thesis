@@ -282,7 +282,7 @@ class UnityMoveItTrajectoryBridge(Node):
             # self.get_logger().debug("Published actual end effector pose")
 
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-            # self.get_logger().warn(f"Could not transform {self.end_effector_link} to world: {e}")
+            self.get_logger().warn(f"Could not transform {self.end_effector_link} to world: {e}")
             pass
 
 
