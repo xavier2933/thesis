@@ -1,1 +1,4 @@
 rosbag*
+log/*
+*.parquet
+unity_moveit_bridge/unity_moveit_bridge/__pycache__/*
