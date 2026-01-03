@@ -264,7 +264,7 @@ class UnityMoveItTrajectoryBridge(Node):
         try:
             # Look up transform from world to panda_hand
             t = self.tf_buffer.lookup_transform(
-                'world',
+                'panda_link0',
                 self.end_effector_link,
                 rclpy.time.Time()
             )
@@ -282,7 +282,7 @@ class UnityMoveItTrajectoryBridge(Node):
             # self.get_logger().debug("Published actual end effector pose")
 
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
-            self.get_logger().warn(f"Could not transform {self.end_effector_link} to world: {e}")
+            self.get_logger().warn(f"Could not transform {self.end_effector_link} to panda_link0: {e}")
             pass
 
 
