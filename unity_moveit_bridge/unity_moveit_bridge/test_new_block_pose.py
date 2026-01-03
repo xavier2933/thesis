@@ -65,9 +65,18 @@ class MoveArmToBlockTF(Node):
         self.gripper_aut_pub = self.create_publisher(Bool, "/gripper_cmd_aut", 10)
         self.auth_mode_pub = self.create_publisher(Bool, "/autonomous_mode", 10)
 
+        self.current_gripper_open = False
+        self.create_timer(0.1, self.publish_gripper_state)
+
         self.get_logger().info("✅ Move-to-block TF node started")
 
+    def publish_gripper_state(self):
+        msg = Bool(data=self.current_gripper_open)
+        self.gripper_state_pub.publish(msg)
+        self.gripper_aut_pub.publish(msg)
+
     def control_gripper(self, open_gripper: bool):
+        self.current_gripper_open = open_gripper
         # 1. Enable autonomous mode so bridge listens to our command
         self.auth_mode_pub.publish(Bool(data=True))
         
