@@ -12,7 +12,17 @@ from std_msgs.msg import Float32, Bool
 from cv_bridge import CvBridge
 from tf_transformations import quaternion_multiply, quaternion_from_euler, euler_from_quaternion
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+import shutil
+from pathlib import Path
+
+
+'''
+run like this
+python3 ~/thesis_ws/src/unity_moveit_bridge/unity_moveit_bridge/ros_lerobot_recorder.py --repo "Xavier033/test_pick_place" --push
+
+'''
 
 class LeRobotRecorder(Node):
     def __init__(self, repo_id, push_to_hub_flag):
@@ -21,6 +31,13 @@ class LeRobotRecorder(Node):
         self.repo_id = repo_id
         self.push_to_hub_flag = push_to_hub_flag
         
+        # 0. Clean up previous local cache if exists (CRITICAL for schema updates)
+        # This prevents FileExistsError and ensures we don't mix schemas
+        local_dir = Path.home() / ".cache/huggingface/lerobot" / self.repo_id
+        if local_dir.exists():
+            self.get_logger().warn(f"Deleting existing local dataset at {local_dir} to avoid conflicts/schema mismatch.")
+            shutil.rmtree(local_dir)
+
         # 1. Setup LeRobot Dataset
         # Note: We define the features we want to record. 
         # Actions are 7-dim: Delta Position (3) + Delta Rotation (3, Euler/Axis-Angle) + Gripper (1)
@@ -28,8 +45,8 @@ class LeRobotRecorder(Node):
             repo_id=self.repo_id,
             fps=10,
             features={
-                "observation.images.camera_top": {"dtype": "video", "shape": (3, 224, 224), "names": ["channels", "height", "width"]},
-                "observation.images.camera_side": {"dtype": "video", "shape": (3, 224, 224), "names": ["channels", "height", "width"]},
+                "observation.images.agentview_image": {"dtype": "video", "shape": (3, 224, 224), "names": ["channels", "height", "width"]},
+                "observation.images.eye_in_hand_image": {"dtype": "video", "shape": (3, 224, 224), "names": ["channels", "height", "width"]},
                 "observation.state": {"dtype": "float32", "shape": (8,)}, # EEF Pose(7: x,y,z,qx,qy,qz,qw) + Gripper(1)
                 "observation.state.joint": {"dtype": "float32", "shape": (7,)},
                 "action": {"dtype": "float32", "shape": (7,)}, # Delta: dx, dy, dz, droll, dpitch, dyaw, gripper
@@ -146,11 +163,12 @@ class LeRobotRecorder(Node):
 
         # 4. Add to Dataset
         self.dataset.add_frame({
-            "observation.images.camera_top": frame_top,
-            "observation.images.camera_side": frame_side,
+            "observation.images.agentview_image": frame_top,
+            "observation.images.eye_in_hand_image": frame_side,
             "observation.state": np.array(state_vec, dtype=np.float32),
             "observation.state.joint": self.latest_joints,
             "action": np.array(action_vec, dtype=np.float32),
+            "task": "Pick up the block",
         })
 
     def stop_episode(self):
@@ -158,6 +176,12 @@ class LeRobotRecorder(Node):
         self.get_logger().info("Saving episode...")
         self.dataset.save_episode()
         self.get_logger().info("Episode saved.")
+        
+        # FINALIZATION (Detailed Stats & Metadata Flush)
+        # This is strictly required before pushing to ensure all metadata 
+        # (like total_episodes, file footers) is written to disk.
+        self.get_logger().info("Finalizing dataset (writing metadata/stats)...")
+        self.dataset.finalize()
         
         if self.push_to_hub_flag:
             self.get_logger().info(f"Pushing to Hub: {self.repo_id}...")
