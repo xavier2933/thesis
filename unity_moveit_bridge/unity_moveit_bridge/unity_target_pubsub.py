@@ -5,6 +5,7 @@ from geometry_msgs.msg import Pose
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from moveit_msgs.srv import GetPositionIK
+from moveit_msgs.msg import RobotState
 from std_msgs.msg import Header, Bool, Float32
 import copy
 from rclpy.action import ActionClient
@@ -38,6 +39,8 @@ class UnityMoveItTrajectoryBridge(Node):
         self.last_gripper_position = None
         self.position_tolerance = 1e-3
 
+        self.current_joint_state = None
+
         self.gripper_client = ActionClient(self, GripperCommand, '/panda_hand_controller/gripper_cmd')
 
         self.wristAngle = 0.0
@@ -52,6 +55,13 @@ class UnityMoveItTrajectoryBridge(Node):
             Float32,
             '/bc_wrist_angle',
             self.bc_wrist_callback,
+            10
+        )
+
+        self.joint_state_sub = self.create_subscription(
+            JointState,
+            '/joint_states',
+            self.joint_state_callback,
             10
         )
 
@@ -143,6 +153,9 @@ class UnityMoveItTrajectoryBridge(Node):
         if self.autonomous_mode:
             self.wristAngle = msg.data
 
+    def joint_state_callback(self, msg: JointState):
+        self.current_joint_state = msg
+
     def pose_callback(self, pose_msg: Pose):
         """
         Process target pose from either Unity or Dreamer.
@@ -193,6 +206,9 @@ class UnityMoveItTrajectoryBridge(Node):
         ik_req.ik_request.pose_stamped.pose = safe_pose
         ik_req.ik_request.timeout.sec = 1
         ik_req.ik_request.avoid_collisions = True
+
+        if self.current_joint_state is not None:
+            ik_req.ik_request.robot_state.joint_state = self.current_joint_state
 
         future = self.ik_client.call_async(ik_req)
         future.add_done_callback(self.ik_response_callback)

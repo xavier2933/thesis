@@ -35,14 +35,21 @@ class LeRobotRecorder(Node):
             repo_id=self.repo_id,
             fps=10,
             features={
-                "observation.images.agentview_image": {"dtype": "video", "shape": (3, 224, 224), "names": ["channels", "height", "width"]},
-                "observation.images.eye_in_hand_image": {"dtype": "video", "shape": (3, 224, 224), "names": ["channels", "height", "width"]},
+                "observation.images.agentview_image": {
+                    "dtype": "image", 
+                    "shape": (3, 224, 224), 
+                    "names": ["channels", "height", "width"]
+                },
+                "observation.images.eye_in_hand_image": {
+                    "dtype": "image", 
+                    "shape": (3, 224, 224), 
+                    "names": ["channels", "height", "width"]
+                },
                 "observation.state": {"dtype": "float32", "shape": (8,)}, 
                 "observation.state.joint": {"dtype": "float32", "shape": (7,)},
                 "action": {"dtype": "float32", "shape": (7,)}, 
             },
-            use_videos=True,
-            image_writer_threads=4  # Added to help the AV1 encoder speed up
+            use_videos=False  # Explicitly tell it we aren't using video
         )
 
         # Rate limiting (10Hz)
