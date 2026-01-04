@@ -105,6 +105,24 @@ class SmolVLAOrchestrator(Node):
         self.create_subscription(Pose, "/target_pose_ros", self.target_pose_callback, 10)
         self.create_subscription(Bool, "/gripper_cmd_aut", self.gripper_cmd_callback, 10)
 
+        self.create_subscription(Bool, "/gripper_cmd_aut", self.gripper_cmd_callback, 10)
+
+    def refresh_tf(self):
+        """Re-initializes TF buffer to handle simulation time resets."""
+        self.get_logger().info("🔄 Refreshing TF Buffer...")
+        # Manually unregister old listener if possible (Python API is limited here, relying on GC)
+        if hasattr(self, 'tf_listener'):
+            del self.tf_listener
+        if hasattr(self, 'tf_buffer'):
+            self.tf_buffer.clear()
+            del self.tf_buffer
+        
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        
+        # Wait a moment for buffer to fill
+        time.sleep(1.0)
+
     # --- RECORDING CALLBACKS ---
     def master_shutter_callback(self, msg):
         now = time.time()
@@ -255,15 +273,19 @@ class SmolVLAOrchestrator(Node):
                 motion_success = True
                 try:
                     # --- Your Execution Sequence ---
+                    self.refresh_tf() # 🌟 Clear TF buffer to accept timestamps from T=0 (post-reset)
                     self.control_gripper(True)
+
+                    # Simple lookup - the buffer is fresh, so whatever we find is new
                     tf = self.tf_buffer.lookup_transform(self.base_frame, self.target_frame, rclpy.time.Time())
+                    q_block = [tf.transform.rotation.x, tf.transform.rotation.y, tf.transform.rotation.z, tf.transform.rotation.w]
                     q_block = [tf.transform.rotation.x, tf.transform.rotation.y, tf.transform.rotation.z, tf.transform.rotation.w]
                     q_correction = quaternion_from_euler(-1.57079632679, 0.0, 0.0)
                     q_fixed = quaternion_multiply(q_block, q_correction)
                     
-                    tx, ty, tz = tf.transform.translation.x + 0.04, tf.transform.translation.y - 0.02, tf.transform.translation.z
+                    tx, ty, tz = tf.transform.translation.x + 0.04, tf.transform.translation.y - 0.015, tf.transform.translation.z
                     self.move_to_pose(tx, ty, tz + 0.13, q_fixed, 3.0) 
-                    self.move_to_pose(tx, ty, tz + 0.07, q_fixed, 2.0) 
+                    self.move_to_pose(tx, ty, tz + 0.07, q_fixed, 3.0) 
                     self.control_gripper(False) 
                     self.move_to_pose(tx, ty, tz + 0.15, q_fixed, 2.0) 
                 except Exception as e:
