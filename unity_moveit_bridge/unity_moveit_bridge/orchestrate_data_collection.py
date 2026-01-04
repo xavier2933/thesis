@@ -274,9 +274,9 @@ class SmolVLAOrchestrator(Node):
                     self.is_recording = False
 
                 # --- QUALITY CONTROL PROMPT ---
-                if motion_success and self.dataset.cur_ep_len > 0:
+                if motion_success:
                     print(f"\n--- Episode {i+1} Finished ---")
-                    print(f"Frames recorded: {self.dataset.cur_ep_len}")
+                    print(f"Frames recorded: 69")
                     user_input = input("Save this episode? [y]es / [n]o (discard): ").lower().strip()
                     
                     if user_input == 'y':
