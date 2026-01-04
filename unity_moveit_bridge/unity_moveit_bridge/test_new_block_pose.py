@@ -184,9 +184,10 @@ class MoveArmToBlockTF(Node):
             tf.transform.rotation.z,
             tf.transform.rotation.w
         ]
-        # +90° about Z to fix Unity → ROS convention mismatch
+        # Apply correction in the block's local frame
+        # q_correction represents the rotation from block frame to gripper frame
         q_correction = quaternion_from_euler(-1.57079632679, 0.0, 0.0)
-        q_fixed = quaternion_multiply(q_correction, q_block)
+        q_fixed = quaternion_multiply(q_block, q_correction)
 
         # Define poses
         # Format: (name, z_offset, duration)
@@ -210,7 +211,7 @@ class MoveArmToBlockTF(Node):
             pose.header.stamp = self.get_clock().now().to_msg()
             
             pose.pose.position.x = tf.transform.translation.x + 0.04
-            pose.pose.position.y = tf.transform.translation.y - 0.01
+            pose.pose.position.y = tf.transform.translation.y - 0.02
             pose.pose.position.z = tf.transform.translation.z + z_offset
 
             pose.pose.orientation.x = q_fixed[0]

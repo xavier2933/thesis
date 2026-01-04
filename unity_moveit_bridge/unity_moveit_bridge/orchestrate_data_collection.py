@@ -16,7 +16,7 @@ from geometry_msgs.msg import Pose, PoseStamped
 from std_msgs.msg import Bool
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from moveit_msgs.srv import GetPositionIK
-from moveit_msgs.msg import MoveItErrorCodes
+from moveit_msgs.msg import MoveItErrorCodes, RobotState
 from cv_bridge import CvBridge
 from tf_transformations import euler_from_quaternion, quaternion_multiply, quaternion_from_euler
 import tf2_ros
@@ -231,7 +231,7 @@ class SmolVLAOrchestrator(Node):
             pt = JointTrajectoryPoint(positions=joints, time_from_start=rclpy.duration.Duration(seconds=duration).to_msg())
             traj.points = [pt]
             self.arm_pub.publish(traj)
-            time.sleep(duration + 0.2)
+            time.sleep(duration + 0.5)
         else:
             self.get_logger().error("IK Failed")
 
@@ -258,9 +258,10 @@ class SmolVLAOrchestrator(Node):
                     self.control_gripper(True)
                     tf = self.tf_buffer.lookup_transform(self.base_frame, self.target_frame, rclpy.time.Time())
                     q_block = [tf.transform.rotation.x, tf.transform.rotation.y, tf.transform.rotation.z, tf.transform.rotation.w]
-                    q_fixed = quaternion_multiply(quaternion_from_euler(-1.57, 0, 0), q_block)
+                    q_correction = quaternion_from_euler(-1.57079632679, 0.0, 0.0)
+                    q_fixed = quaternion_multiply(q_block, q_correction)
                     
-                    tx, ty, tz = tf.transform.translation.x + 0.04, tf.transform.translation.y - 0.01, tf.transform.translation.z
+                    tx, ty, tz = tf.transform.translation.x + 0.04, tf.transform.translation.y - 0.02, tf.transform.translation.z
                     self.move_to_pose(tx, ty, tz + 0.13, q_fixed, 3.0) 
                     self.move_to_pose(tx, ty, tz + 0.07, q_fixed, 2.0) 
                     self.control_gripper(False) 
