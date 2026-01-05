@@ -49,15 +49,29 @@ class SmolVLAOrchestrator(Node):
             repo_id=self.repo_id,
             fps=fps,
             root=self.root_path,
-            features={
-                "observation.images.agentview_image": {"dtype": "video", "shape": (3, 224, 224), "names": ["channels", "height", "width"]},
-                "observation.images.eye_in_hand_image": {"dtype": "video", "shape": (3, 224, 224), "names": ["channels", "height", "width"]},
-                "observation.state": {"dtype": "float32", "shape": (8,), "names": ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper"]},
-                "observation.state.joint": {"dtype": "float32", "shape": (7,), "names": ["j1", "j2", "j3", "j4", "j5", "j6", "j7"]},
-                "action": {"dtype": "float32", "shape": (7,), "names": ["dx", "dy", "dz", "dr", "dp", "dyaw", "gripper"]},
+            features = {
+                "observation.images.image": {
+                    "dtype": "image",
+                    "shape": [3, 256, 256], # Matches your config.json
+                    "names": ["channels", "height", "width"],
+                },
+                "observation.images.image2": {
+                    "dtype": "image",
+                    "shape": [3, 256, 256], # Matches your config.json
+                    "names": ["channels", "height", "width"],
+                },
+                "observation.state": {
+                    "dtype": "float32",
+                    "shape": (8,), # Matches your config.json (XYZ, RPY, Grip1, Grip2)
+                    "names": ["x", "y", "z", "roll", "pitch", "yaw", "grip_l", "grip_r"],
+                },
+                "action": {
+                    "dtype": "float32",
+                    "shape": (7,), # Matches your config.json (dXYZ, dRPY, Grip)
+                    "names": ["dx", "dy", "dz", "droll", "dpitch", "dyaw", "grip"],
+                },
             },
-            use_videos=True,
-            batch_encoding_size=1
+            use_videos=True
         )
 
         self.instructions = [
@@ -148,6 +162,7 @@ class SmolVLAOrchestrator(Node):
         with self.data_lock:
             if not self.is_recording:
                 return
+            # Ensure we have all necessary data before proceeding
             if not self.new_side_image or any(v is None for v in [self.latest_eef_pose, self.latest_target_pose, self.latest_joints]):
                 return
             
@@ -158,33 +173,50 @@ class SmolVLAOrchestrator(Node):
             self.new_side_image = False
 
         try:
-            # Process Images
-            img_top = cv2.resize(self.bridge.compressed_imgmsg_to_cv2(snap_top, "rgb8"), (224, 224)).transpose(2, 0, 1)
-            img_side = cv2.resize(self.bridge.compressed_imgmsg_to_cv2(snap_side, "rgb8"), (224, 224)).transpose(2, 0, 1)
+            # 1. Process Images: Resize to 256x256 as per config.json
+            img_top = cv2.resize(self.bridge.compressed_imgmsg_to_cv2(snap_top, "rgb8"), (256, 256)).transpose(2, 0, 1)
+            img_side = cv2.resize(self.bridge.compressed_imgmsg_to_cv2(snap_side, "rgb8"), (256, 256)).transpose(2, 0, 1)
 
-            # State & Action Logic
-            gripper_val = 1.0 if snap_gripper else -1.0
-            state_vec = np.array([snap_eef.position.x, snap_eef.position.y, snap_eef.position.z,
-                                  snap_eef.orientation.x, snap_eef.orientation.y, snap_eef.orientation.z, snap_eef.orientation.w, 
-                                  gripper_val], dtype=np.float32)
-
-            c_rpy = euler_from_quaternion([snap_eef.orientation.x, snap_eef.orientation.y, snap_eef.orientation.z, snap_eef.orientation.w])
-            t_rpy = euler_from_quaternion([snap_target.orientation.x, snap_target.orientation.y, snap_target.orientation.z, snap_target.orientation.w])
-            d_rpy = [( (t - c) + np.pi) % (2 * np.pi) - np.pi for t, c in zip(t_rpy, c_rpy)]
+            # 2. Logic for Rotation and Gripper
+            gripper_val = -1.0 if snap_gripper else 1.0  # -1 = Closed, 1 = Open
             
-            action_vec = np.array([snap_target.position.x - snap_eef.position.x,
-                                   snap_target.position.y - snap_eef.position.y,
-                                   snap_target.position.z - snap_eef.position.z,
-                                   d_rpy[0], d_rpy[1], d_rpy[2], gripper_val], dtype=np.float32)
+            # End-Effector RPY
+            c_rpy = euler_from_quaternion([snap_eef.orientation.x, snap_eef.orientation.y, 
+                                           snap_eef.orientation.z, snap_eef.orientation.w])
+            
+            # Target RPY for Delta calculation
+            t_rpy = euler_from_quaternion([snap_target.orientation.x, snap_target.orientation.y, 
+                                           snap_target.orientation.z, snap_target.orientation.w])
+            
+            # Compute Delta RPY (shortest path on a circle)
+            d_rpy = [( (t - c) + np.pi) % (2 * np.pi) - np.pi for t, c in zip(t_rpy, c_rpy)]
 
+            # 3. State Vector: 8-DOF (XYZ, RPY, Finger1, Finger2)
+            # We use [gripper_val, -gripper_val] to match LIBERO's symmetric finger encoding
+            state_vec = np.array([
+                snap_eef.position.x, snap_eef.position.y, snap_eef.position.z,
+                c_rpy[0], c_rpy[1], c_rpy[2], 
+                gripper_val, -gripper_val
+            ], dtype=np.float32)
+
+            # 4. Action Vector: 7-DOF (dXYZ, dRPY, Gripper_Command)
+            action_vec = np.array([
+                snap_target.position.x - snap_eef.position.x,
+                snap_target.position.y - snap_eef.position.y,
+                snap_target.position.z - snap_eef.position.z,
+                d_rpy[0], d_rpy[1], d_rpy[2], 
+                gripper_val
+            ], dtype=np.float32)
+
+            # 5. Save to LeRobot Dataset
             self.dataset.add_frame({
-                "observation.images.agentview_image": img_top.astype(np.uint8),
-                "observation.images.eye_in_hand_image": img_side.astype(np.uint8),
+                "observation.images.image": img_top.astype(np.uint8),
+                "observation.images.image2": img_side.astype(np.uint8),
                 "observation.state": state_vec,
-                "observation.state.joint": snap_joints,
                 "action": action_vec,
                 "task": self.current_task,
             })
+
         except Exception as e:
             self.get_logger().error(f"Record Error: {e}")
 
@@ -326,6 +358,7 @@ def main():
     rclpy.init()
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=str, required=True)
+    # Xavier033/pick_place_LIBERO
     parser.add_argument("--episodes", type=int, default=10)
     args = parser.parse_args()
 
