@@ -32,7 +32,7 @@ from huggingface_hub import snapshot_download, hf_hub_download
 
 
 class SmolVLAInference(Node):
-    def __init__(self, checkpoint_path, task_instruction, device="cuda", stats_path=None):
+    def __init__(self, checkpoint_path, task_instruction, device="cuda", stats_path=None, subfolder=None):
         super().__init__("smolvla_inference")
         self.bridge = CvBridge()
         self.device = device
@@ -41,9 +41,33 @@ class SmolVLAInference(Node):
         # Load Policy using new API
         self.get_logger().info(f"🤖 Loading SmolVLA from {checkpoint_path}")
         
-        # Load pretrained config from the checkpoint
-        policy_cfg = PreTrainedConfig.from_pretrained(checkpoint_path)
+        # Handle subfolder for checkpoint weights
+        original_checkpoint = checkpoint_path
+        if subfolder and "/" in checkpoint_path:
+            self.get_logger().info(f"📂 Downloading subfolder '{subfolder}' from {checkpoint_path}...")
+            from pathlib import Path
+            
+            # Download both root (for config) and checkpoint subfolder (for weights)
+            repo_path = snapshot_download(repo_id=checkpoint_path)
+            
+            # Config is at root
+            config_path = repo_path
+            # Weights are in subfolder/pretrained_model/
+            weights_path = str(Path(repo_path) / subfolder / "pretrained_model")
+            
+            self.get_logger().info(f"✅ Config from: {config_path}")
+            self.get_logger().info(f"✅ Weights from: {weights_path}")
+        else:
+            # No subfolder - everything at root
+            config_path = checkpoint_path
+            weights_path = checkpoint_path
+        
+        # Load config from root
+        policy_cfg = PreTrainedConfig.from_pretrained(config_path)
         policy_cfg.device = device
+        
+        # Override pretrained_path to point to weights location
+        policy_cfg.pretrained_path = weights_path
         
         # Load dataset metadata from the LIBERO dataset (not the model checkpoint)
         # This provides the feature shapes and normalization stats
@@ -167,7 +191,7 @@ class SmolVLAInference(Node):
         
         # Control rate (10Hz to match training FPS)
         self.control_rate = 10.0
-
+        self.control_timer = self.create_timer(1.0 / self.control_rate, self.control_loop)
         
     # --- CALLBACKS ---
     def top_camera_callback(self, msg):
@@ -190,66 +214,45 @@ class SmolVLAInference(Node):
                 self.latest_joints = np.array(msg.position[:7], dtype=np.float32)
     
     # --- CONTROL LOGIC ---
-    def run_inference_loop(self):
-        """Main control loop - runs in separate thread"""
-        last_cycle_start = time.time()
+    def control_loop(self):
+        """Main control loop - runs at 10Hz"""
+        with self.data_lock:
+            if not self.new_data or any(v is None for v in [
+                self.latest_image_top, 
+                self.latest_image_side, 
+                self.latest_eef_pose,
+                self.latest_joints  # Add joint state check
+            ]):
+                return
+            
+            # Snapshot data
+            snap_top = self.latest_image_top
+            snap_side = self.latest_image_side
+            snap_eef = self.latest_eef_pose
+            snap_joints = self.latest_joints  # Snapshot current joints
+            self.new_data = False
         
-        while rclpy.ok():
-            now = time.time()
-            cycle_dt = now - last_cycle_start
-            last_cycle_start = now
+        try:
+            # 1. Prepare observation
+            observation = self.prepare_observation(snap_top, snap_side, snap_eef)
             
-            # Clamp cycle_dt to reasonable bounds for trajectory execution
-            # If inference is fast (10Hz), dt is ~0.1s. If slow (0.15Hz), dt is ~6s.
-            # We add a small buffer (1.2x) to ensure smooth blending without stopping.
-            exec_duration = max(0.5, cycle_dt * 1.2)
+            # 2. Get action from policy (new API)
+            with torch.no_grad():
+                # Forward pass through policy
+                # The policy expects a batch dict and returns actions
+                action_dict = self.policy.select_action(observation)
+                
+                # Extract action tensor
+                if isinstance(action_dict, dict):
+                    action = action_dict.get("action", action_dict.get("actions"))
+                else:
+                    action = action_dict
             
-            with self.data_lock:
-                if not self.new_data or any(v is None for v in [
-                    self.latest_image_top, 
-                    self.latest_image_side, 
-                    self.latest_eef_pose,
-                    self.latest_joints
-                ]):
-                    time.sleep(0.01)
-                    continue
-                
-                # Snapshot data
-                snap_top = self.latest_image_top
-                snap_side = self.latest_image_side
-                snap_eef = self.latest_eef_pose
-                snap_joints = self.latest_joints
-                self.new_data = False
+            # 3. Execute action (pass current joints for IK seeding)
+            self.execute_action(action, snap_eef, snap_joints)
             
-            try:
-                # 1. Prepare observation
-                observation = self.prepare_observation(snap_top, snap_side, snap_eef)
-                
-                # 2. Get action from policy
-                t0 = time.time()
-                with torch.no_grad():
-                    action_dict = self.policy.select_action(observation)
-                    if isinstance(action_dict, dict):
-                        action = action_dict.get("action", action_dict.get("actions"))
-                    else:
-                        action = action_dict
-                inference_time = time.time() - t0
-                
-                # Log performance occasionally
-                self.get_logger().info(
-                    f"Inference: {inference_time:.3f}s | Cycle: {cycle_dt:.3f}s | Exec: {exec_duration:.3f}s"
-                )
-                
-                # 3. Execute action (pass adaptive duration)
-                self.execute_action(action, snap_eef, snap_joints, duration=exec_duration)
-                
-            except Exception as e:
-                self.get_logger().error(f"Control loop error: {e}")
-            
-            # Sleep to maintain rate (only if we are faster than target rate)
-            elapsed = time.time() - now
-            sleep_time = max(0.0, (1.0 / self.control_rate) - elapsed)
-            time.sleep(sleep_time)
+        except Exception as e:
+            self.get_logger().error(f"Control loop error: {e}")
     
     def prepare_observation(self, img_top_msg, img_side_msg, eef_pose):
         """Convert ROS messages to policy input format"""
@@ -299,7 +302,7 @@ class SmolVLAInference(Node):
         
         return observation
     
-    def execute_action(self, action, current_eef_pose, current_joints, duration=0.15):
+    def execute_action(self, action, current_eef_pose, current_joints):
         """Execute predicted action on the robot"""
         # Action format: [dx, dy, dz, droll, dpitch, dyaw, gripper]
         action = action.cpu().numpy().squeeze()
@@ -369,7 +372,7 @@ class SmolVLAInference(Node):
         joints = self.get_ik_solution(pose_stamped, current_joints)
         if joints:
             self.get_logger().info("✓ IK solved, moving arm")
-            self.move_to_joints(joints, duration=duration)  # Use adaptive duration
+            self.move_to_joints(joints, duration=0.15)  # Slightly longer for smoothness
         else:
             self.get_logger().warn("✗ IK failed - arm not moving")
     
@@ -398,7 +401,7 @@ class SmolVLAInference(Node):
         future = self.ik_client.call_async(req)
         future.add_done_callback(done_callback)
         
-        if not event.wait(timeout=3.0):
+        if not event.wait(timeout=1.0):
             self.get_logger().warn("IK service timed out")
             return None
         
@@ -471,6 +474,12 @@ def main():
         default=None,
         help="Path to stats.json for action denormalization (from your dataset)"
     )
+    parser.add_argument(
+        "--subfolder",
+        type=str,
+        default=None,
+        help="Subfolder in HF repo (e.g., 'checkpoints/003000')"
+    )
     
     args = parser.parse_args()
     
@@ -480,6 +489,7 @@ def main():
         task_instruction=args.task,
         device=args.device,
         stats_path=args.stats,
+        subfolder=args.subfolder,
     )
     
     # Optional reset
@@ -490,10 +500,6 @@ def main():
     node.get_logger().info("🚀 Starting inference loop at 10Hz...")
     node.get_logger().info("Press Ctrl+C to stop")
     
-    # Run loop in a separate thread so ROS callbacks stay alive
-    thread = threading.Thread(target=node.run_inference_loop, daemon=True)
-    thread.start()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
