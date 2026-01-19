@@ -292,9 +292,9 @@ class ReplayEpisodeNode(Node):
         req.ik_request.ik_link_name = self.ee_link
         req.ik_request.avoid_collisions = True
         
-        if current_joints is not None:
-            req.ik_request.robot_state.joint_state.name = self.joint_names
-            req.ik_request.robot_state.joint_state.position = current_joints.tolist()
+        # if current_joints is not None:
+        #     req.ik_request.robot_state.joint_state.name = self.joint_names
+        #     req.ik_request.robot_state.joint_state.position = current_joints.tolist()
         
         event = threading.Event()
         result_wrapper = {"res": None}

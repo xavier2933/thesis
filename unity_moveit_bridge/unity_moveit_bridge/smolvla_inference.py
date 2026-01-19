@@ -321,8 +321,8 @@ class SmolVLAInference(Node):
             "observation.images.image2": torch.from_numpy(img_side).float().unsqueeze(0).to(self.device) / 255.0,
         '''
         observation = {
-            "observation.images.image": torch.from_numpy(img_top).float().unsqueeze(0).to(self.device),
-            "observation.images.image2": torch.from_numpy(img_side).float().unsqueeze(0).to(self.device),
+            "observation.images.image": torch.from_numpy(img_top).float().unsqueeze(0).to(self.device) / 255.0,
+            "observation.images.image2": torch.from_numpy(img_side).float().unsqueeze(0).to(self.device) / 255.0,
             "observation.state": torch.from_numpy(state).unsqueeze(0).to(self.device),
             "observation.language.tokens": tokens["input_ids"].to(self.device),
             "observation.language.attention_mask": tokens["attention_mask"].to(self.device),
