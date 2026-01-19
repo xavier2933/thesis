@@ -255,7 +255,7 @@ class UnityMoveItTrajectoryBridge(Node):
         self._execute_gripper_command(msg.data)
 
     def _execute_gripper_command(self, open_gripper: bool):
-        position = 0.08 if open_gripper else 0.0
+        position = 0.099 if open_gripper else 0.0
         max_effort = 2.0
 
         if self.last_gripper_position is not None:
