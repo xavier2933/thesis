@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'driving_package = driving_package.bt_node:main',
+            'rover_commander = driving_package.rover_commander:main',
         ],
     },
 )
