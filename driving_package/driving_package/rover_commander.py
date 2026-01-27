@@ -93,6 +93,9 @@ class RoverCommander(Node):
             ty = tf.transform.translation.y
             tz = tf.transform.translation.z
 
+            xoffset = 0.02
+            tx += xoffset
+
             # 1. Move to hover position over plate
             self.get_logger().info("📍 Hovering over plate...")
             self.move_to_pose(tx, ty, tz + 0.20, q_placement, 3.0)
