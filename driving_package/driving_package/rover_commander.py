@@ -38,6 +38,8 @@ class RoverCommander(Node):
         self.arm_pub = self.create_publisher(JointTrajectory, "/panda_arm_controller/joint_trajectory", 10)
         self.target_pub = self.create_publisher(Pose, "/target_pose_ros", 10)
         self.gripper_aut_pub = self.create_publisher(Bool, "/gripper_cmd_aut", 10)
+        self.rope_pub = self.create_publisher(Bool, 'rover/deploy_rope', 10)
+        self.waypoint_pub = self.create_publisher(Pose, 'rover/waypoint', 10)
         
         # --- Subscribers ---
         self.plate_sub = self.create_subscription(PoseArray, 'rover/plate_locations', self.plate_locations_callback, 10)
@@ -56,8 +58,124 @@ class RoverCommander(Node):
         self.get_logger().info("[ROVER] Commander node initialized")
         
         self.get_logger().info("[ROVER] Waiting for plate locations from Unity...")
-    
-    
+
+    def drive_distance_with_rope(self, distance_meters, deploy_rope=True):
+        """Drives until a certain distance is covered while rope state is set."""
+        start_pos = np.array(self.rover_position)
+        
+        # Toggle rope
+        self.rope_pub.publish(Bool(data=deploy_rope))
+        self.get_logger().info(f"[ROPE] Deployment: {deploy_rope}. Driving {distance_meters}m...")
+
+        distance_covered = 0.0
+        while distance_covered < distance_meters:
+            current_pos = np.array(self.rover_position)
+            distance_covered = np.linalg.norm(current_pos - start_pos)
+            time.sleep(0.1) # Check at 10Hz
+        
+        self.get_logger().info(f"[ROPE] Target distance {distance_meters}m reached.")
+
+
+    def send_waypoint(self, x, y, z):
+        """Publishes a raw coordinate to Unity."""
+        msg = Pose()
+        msg.position.x = float(x)
+        msg.position.y = float(y)
+        msg.position.z = float(z)
+        # Identity orientation
+        msg.orientation.w = 1.0
+        self.waypoint_pub.publish(msg)
+        self.get_logger().info(f"[WAYPOINT] Sent: {x}, {y}, {z}")
+
+    def wait_for_waypoint_arrival(self, target_pos, tolerance=0.5):
+        """Blocks until rover is near a specific coordinate."""
+        self.get_logger().info(f"⏳ Navigating to {target_pos}...")
+        while True:
+            curr = np.array(self.rover_position)
+            dist = np.linalg.norm(curr - np.array(target_pos))
+            if dist < tolerance:
+                self.get_logger().info("✅ Reached Waypoint.")
+                return True
+            time.sleep(0.1)
+
+    def deploy_antenna(self):
+        """
+        Unity-Managed Waypoint Sequence:
+        1. Send Point A -> Wait for Unity to stop navigating
+        2. Start Rope
+        3. Send Point B -> Wait for Unity to stop navigating
+        4. Deploy Preamp
+        5. Send Point C -> Wait for Unity to stop navigating
+        6. Stop Rope
+        """
+        pts = [
+            [405.0, 18.0, 255.0],
+            [410.0, 18.0, 255.0],
+            [415.0, 18.0, 255.0]
+        ]
+
+        self.get_logger().info("🚀 STARTING ANTENNA DEPLOYMENT (Unity-Terminated)")
+
+        # --- POINT 1 ---
+        self.send_waypoint(*pts[0])
+        if not self.wait_for_unity_arrival():
+            self.get_logger().error("❌ Antenna deployment aborted at point 1")
+            return
+
+        # --- POINT 2 & ROPE ---
+        self.get_logger().info("🪢 Starting Rope Deployment...")
+        self.rope_pub.publish(Bool(data=True))
+        self.send_waypoint(*pts[1])
+        if not self.wait_for_unity_arrival():
+            self.get_logger().error("❌ Antenna deployment aborted at point 2")
+            self.rope_pub.publish(Bool(data=False))  # Safety: stop rope
+            return
+
+        # --- LOGIC TRIGGER ---
+        self.get_logger().info("📡 [LOGIC] Deploying Preamp...")
+        time.sleep(1.0) 
+
+        # --- POINT 3 ---
+        self.send_waypoint(*pts[2])
+        if not self.wait_for_unity_arrival():
+            self.get_logger().error("❌ Antenna deployment aborted at point 3")
+            self.rope_pub.publish(Bool(data=False))  # Safety: stop rope
+            return
+
+        # --- FINISH ---
+        self.rope_pub.publish(Bool(data=False))
+        self.get_logger().info("✅ ANTENNA DEPLOYMENT COMPLETE")
+
+    def wait_for_unity_arrival(self, timeout=60.0):
+        """Blocks until Unity reports navigation complete (isNavigating = False).
+        
+        Two-phase wait:
+        1. Wait for Unity to acknowledge and START navigation (isNavigating = True)
+        2. Wait for Unity to report arrival (isNavigating = False)
+        """
+        start_time = time.time()
+        
+        # Phase 1: Wait for Unity to START navigating (acknowledge the waypoint)
+        self.get_logger().info("⏳ Waiting for Unity to acknowledge waypoint...")
+        while not self.is_navigating:
+            if time.time() - start_time > timeout:
+                self.get_logger().error("⏰ Timeout waiting for navigation to start!")
+                return False
+            time.sleep(0.1)
+        
+        self.get_logger().info("🚗 Unity navigation started, waiting for arrival...")
+        
+        # Phase 2: Wait for Unity to FINISH navigating (arrival)
+        while self.is_navigating:
+            if time.time() - start_time > timeout:
+                self.get_logger().error("⏰ Timeout waiting for arrival!")
+                return False
+            time.sleep(0.1)
+        
+        self.get_logger().info("📍 Unity reported arrival.")
+        return True
+        
+        
     def drive_pick_and_place(self, plate_index):
         """Full autonomous loop: Drive, Pick, Place."""
         self.get_logger().info(f"\n{'='*50}\n🚀 STARTING PICK-AND-PLACE SEQUENCE\n{'='*50}")
@@ -136,7 +254,8 @@ class RoverCommander(Node):
         # Start the orchestration sequence once we have plate positions
         if not self.sequence_started and len(self.plate_positions) > 0:
             self.sequence_started = True
-            thread = threading.Thread(target=self.drive_to_plate_pick_and_place, args=(0,), daemon=True)
+            # thread = threading.Thread(target=self.drive_to_plate_pick_and_place, args=(0,), daemon=True)
+            thread = threading.Thread(target=self.deploy_antenna, daemon=True)
             thread.start()
 
     def status_callback(self, msg):
