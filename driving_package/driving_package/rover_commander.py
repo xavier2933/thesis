@@ -98,53 +98,182 @@ class RoverCommander(Node):
                 return True
             time.sleep(0.1)
 
-    def deploy_antenna(self):
+    # ==================== PUBLIC API FOR GRID DEPLOYMENT ====================
+    # These methods are designed to be called from a higher-level orchestration script
+    
+    def go_to_site(self, x: float, y: float, z: float) -> bool:
         """
-        Unity-Managed Waypoint Sequence:
-        1. Send Point A -> Wait for Unity to stop navigating
-        2. Start Rope
-        3. Send Point B -> Wait for Unity to stop navigating
-        4. Deploy Preamp
-        5. Send Point C -> Wait for Unity to stop navigating
-        6. Stop Rope
+        Navigate rover to a specific site. Blocks until arrival.
+        
+        Args:
+            x, y, z: World coordinates of the target site
+            
+        Returns:
+            True if arrived successfully, False on timeout/failure
         """
+        self.get_logger().info(f"📍 Navigating to site ({x:.1f}, {y:.1f}, {z:.1f})...")
+        self.send_waypoint(x, y, z)
+        return self.wait_for_unity_arrival()
+    
+    def deploy_antenna_at_current_site(self) -> bool:
+        """
+        Deploy an antenna at the rover's current location.
+        Assumes rover has already arrived (Unity broadcasts target_plate TF).
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        self.get_logger().info("� Deploying antenna at current site...")
+        return self.pick_and_place_at_waypoint()
+    
+    def deploy_antenna_at_site(self, x: float, y: float, z: float) -> bool:
+        """
+        Convenience method: Navigate to site AND deploy antenna.
+        
+        Args:
+            x, y, z: World coordinates of the deployment site
+            
+        Returns:
+            True if both navigation and deployment succeeded
+        """
+        self.get_logger().info(f"\n{'='*40}\n� DEPLOY ANTENNA AT ({x:.1f}, {y:.1f}, {z:.1f})\n{'='*40}")
+        
+        if not self.go_to_site(x, y, z):
+            self.get_logger().error(f"❌ Failed to reach site ({x:.1f}, {y:.1f}, {z:.1f})")
+            return False
+        
+        if not self.deploy_antenna_at_current_site():
+            self.get_logger().error(f"❌ Failed to deploy at site ({x:.1f}, {y:.1f}, {z:.1f})")
+            return False
+        
+        self.get_logger().info(f"✅ Antenna deployed at ({x:.1f}, {y:.1f}, {z:.1f})")
+        return True
+    
+    def set_rope(self, deploying: bool):
+        """
+        Control rope deployment state.
+        
+        Args:
+            deploying: True to start deploying rope, False to stop
+        """
+        self.rope_pub.publish(Bool(data=deploying))
+        state = "STARTED" if deploying else "STOPPED"
+        self.get_logger().info(f"🪢 Rope deployment {state}")
+    
+    def deploy_grid(self, sites: list) -> int:
+        """
+        Deploy antennas at multiple sites in sequence.
+        
+        Sequence logic:
+        - First waypoint: Navigate, then START rope (no arm action)
+        - Middle waypoints: Navigate, then pick & place
+        - Last waypoint: Navigate, then STOP rope (no arm action)
+        
+        Args:
+            sites: List of [x, y, z] coordinates (minimum 3 required)
+            
+        Returns:
+            Number of successfully deployed antennas (middle waypoints only)
+        """
+        if len(sites) < 3:
+            self.get_logger().error("Need at least 3 waypoints (start, middle, end)")
+            return 0
+        
+        self.get_logger().info(f"STARTING GRID DEPLOYMENT ({len(sites)} sites)")
+        self.get_logger().info(f"   First site: Start rope")
+        self.get_logger().info(f"   Middle sites ({len(sites)-2}): Pick and Place")
+        self.get_logger().info(f"   Last site: Stop rope")
+        
+        success_count = 0
+        
+        for i, site in enumerate(sites):
+            is_first = (i == 0)
+            is_last = (i == len(sites) - 1)
+            is_middle = not is_first and not is_last
+            
+            # Navigate to site
+            self.get_logger().info(f"\n{'='*40}")
+            if is_first:
+                self.get_logger().info(f"SITE {i+1}/{len(sites)}: START POSITION")
+            elif is_last:
+                self.get_logger().info(f"SITE {i+1}/{len(sites)}: END POSITION")
+            else:
+                self.get_logger().info(f"SITE {i+1}/{len(sites)}: DEPLOYMENT POINT")
+            self.get_logger().info(f"{'='*40}")
+            
+            if not self.go_to_site(*site):
+                self.get_logger().error(f"Failed to reach site {i+1}")
+                if not is_first:
+                    self.set_rope(False)
+                return success_count
+            
+            # First waypoint: Start rope
+            if is_first:
+                self.get_logger().info("Starting rope deployment...")
+                self.set_rope(True)
+            
+            # Middle waypoints: Pick and Place
+            elif is_middle:
+                self.get_logger().info("Executing pick and place...")
+                if self.deploy_antenna_at_current_site():
+                    success_count += 1
+                else:
+                    self.get_logger().error(f"Pick and place failed at site {i+1}")
+            
+            # Last waypoint: Stop rope
+            elif is_last:
+                self.get_logger().info("Stopping rope deployment...")
+                self.set_rope(False)
+        
+        self.get_logger().info(f"\n{'='*40}")
+        self.get_logger().info(f"GRID DEPLOYMENT COMPLETE: {success_count}/{len(sites)-2} antennas deployed")
+        self.get_logger().info(f"{'='*40}")
+        return success_count
+    
+    # ==================== INTERNAL TEST METHOD ====================
+    
+    def _test_deploy_sequence(self):
+        """Internal test: Deploy at 3 hardcoded waypoints."""
         pts = [
             [405.0, 18.0, 255.0],
-            [410.0, 18.0, 255.0],
+            [412.0, 18.0, 255.0],
             [415.0, 18.0, 255.0]
         ]
-
-        self.get_logger().info("🚀 STARTING ANTENNA DEPLOYMENT (Unity-Terminated)")
-
-        # --- POINT 1 ---
-        self.send_waypoint(*pts[0])
-        if not self.wait_for_unity_arrival():
-            self.get_logger().error("❌ Antenna deployment aborted at point 1")
-            return
-
-        # --- POINT 2 & ROPE ---
-        self.get_logger().info("🪢 Starting Rope Deployment...")
-        self.rope_pub.publish(Bool(data=True))
-        self.send_waypoint(*pts[1])
-        if not self.wait_for_unity_arrival():
-            self.get_logger().error("❌ Antenna deployment aborted at point 2")
-            self.rope_pub.publish(Bool(data=False))  # Safety: stop rope
-            return
-
-        # --- LOGIC TRIGGER ---
-        self.get_logger().info("📡 [LOGIC] Deploying Preamp...")
-        time.sleep(1.0) 
-
-        # --- POINT 3 ---
-        self.send_waypoint(*pts[2])
-        if not self.wait_for_unity_arrival():
-            self.get_logger().error("❌ Antenna deployment aborted at point 3")
-            self.rope_pub.publish(Bool(data=False))  # Safety: stop rope
-            return
-
-        # --- FINISH ---
-        self.rope_pub.publish(Bool(data=False))
-        self.get_logger().info("✅ ANTENNA DEPLOYMENT COMPLETE")
+        self.deploy_grid(pts)
+    
+    def pick_and_place_at_waypoint(self):
+        """
+        Execute pick and place sequence at the current waypoint.
+        Unity broadcasts the target_plate TF after arrival.
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Give Unity time to broadcast the TF
+            self.get_logger().info("⏳ Waiting for target TF from Unity...")
+            time.sleep(1.0)
+            
+            # Refresh TF buffer to ensure we have latest transforms
+            self.refresh_tf()
+            
+            # Step 1: Pick up the block
+            self.pick_up_block()
+            time.sleep(0.5)
+            
+            # Step 2: Place block at the target location
+            self.place_block_on_plate()
+            
+            # Step 3: Stow arm for travel
+            self.get_logger().info("📍 Stowing arm for travel...")
+            self.move_to_pose(0.3, 0.0, 0.5, [1.0, 0.0, 0.0, 0.0], 2.0)
+            
+            self.get_logger().info("✅ Pick and place complete at this waypoint!")
+            return True
+            
+        except Exception as e:
+            self.get_logger().error(f"❌ Pick and place error: {e}")
+            return False
 
     def wait_for_unity_arrival(self, timeout=60.0):
         """Blocks until Unity reports navigation complete (isNavigating = False).
