@@ -340,17 +340,25 @@ class RoverCommander(Node):
             ty = tf.transform.translation.y
             tz = tf.transform.translation.z
 
+            # Log the raw TF position
+            self.get_logger().info(f"📍 TARGET_PLATE TF (raw): x={tx:.4f}, y={ty:.4f}, z={tz:.4f}")
+
             xoffset = 0.02
             tx += xoffset
 
+            # Log the adjusted position
+            self.get_logger().info(f"📍 TARGET_PLATE TF (with offset): x={tx:.4f}, y={ty:.4f}, z={tz:.4f}")
+
             # 1. Move to hover position over plate
-            self.get_logger().info("📍 Hovering over plate...")
-            self.move_to_pose(tx, ty, tz + 0.20, q_placement, 3.0)
+            hover_z = tz + 0.20
+            self.get_logger().info(f"📍 Hovering over plate... IK target: ({tx:.4f}, {ty:.4f}, {hover_z:.4f})")
+            self.move_to_pose(tx, ty, hover_z, q_placement, 3.0)
 
             # 2. Lower to plate surface
             # Note: 0.05 is an offset to account for block height so it doesn't clip
-            self.get_logger().info("📍 Lowering block...")
-            self.move_to_pose(tx, ty, tz + 0.08, q_placement, 2.0)
+            lower_z = tz + 0.08
+            self.get_logger().info(f"📍 Lowering block... IK target: ({tx:.4f}, {ty:.4f}, {lower_z:.4f})")
+            self.move_to_pose(tx, ty, lower_z, q_placement, 2.0)
 
             # 3. Open Gripper
             self.get_logger().info("👐 Releasing block...")

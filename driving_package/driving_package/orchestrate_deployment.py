@@ -51,18 +51,33 @@ class DeploymentOrchestrator(Node):
     def _run_deployment(self):
         """Run the deployment sequence."""
         self.get_logger().info("\n" + "="*50)
-        self.get_logger().info("🚀 STARTING ANTENNA GRID DEPLOYMENT")
+        self.get_logger().info("🚀 STARTING ANTENNA ROW DEPLOYMENT")
         self.get_logger().info("="*50 + "\n")
         
         if not self.deployment_sites:
             self.get_logger().error("No deployment sites loaded!")
             return
         
-        # Deploy at all sites
-        success_count = self.commander.deploy_grid(self.deployment_sites)
+        total_sites = len(self.deployment_sites)
+        successful_sites = 0
+        
+        # Each deployment site is a 3-point sequence
+        for i, site in enumerate(self.deployment_sites):
+            self.get_logger().info(f"\n{'#'*50}")
+            self.get_logger().info(f"### DEPLOYMENT SITE {i+1}/{total_sites} ###")
+            self.get_logger().info(f"{'#'*50}")
+            
+            # deploy_grid expects [rope_start, preamp, rope_end]
+            antennas_deployed = self.commander.deploy_grid(site)
+            
+            if antennas_deployed > 0:
+                successful_sites += 1
+                self.get_logger().info(f"✅ Site {i+1} complete: {antennas_deployed} antenna(s) deployed")
+            else:
+                self.get_logger().error(f"❌ Site {i+1} failed")
         
         self.get_logger().info("\n" + "="*50)
-        self.get_logger().info(f"🎉 DEPLOYMENT COMPLETE: {success_count}/{len(self.deployment_sites)}")
+        self.get_logger().info(f"🎉 ROW DEPLOYMENT COMPLETE: {successful_sites}/{total_sites} sites successful")
         self.get_logger().info("="*50 + "\n")
 
 
@@ -98,26 +113,41 @@ def main(args=None):
     orchestrator = DeploymentOrchestrator()
     
     # ==================== CONFIGURATION ====================
-    # Debug sites (the 3 points used during testing)
-    debug_sites = [
-        [405.0, 18.0, 255.0],
-        [412.0, 18.0, 255.0],
-        [415.0, 18.0, 255.0]
+    # Each deployment site is a 3-point sequence: [rope_start, preamp_placement, rope_end]
+    # The rover will:
+    #   1. Go to rope_start and begin deploying rope
+    #   2. Go to preamp_placement and do pick & place
+    #   3. Go to rope_end and stop deploying rope
+    
+    # 4 deployment sites in a row (adjust coordinates as needed)
+    row_of_sites = [
+        # Site 1
+        [
+            [405.0, 18.0, 255.0],  # rope start
+            [410.0, 18.0, 255.0],  # preamp placement
+            [415.0, 18.0, 255.0],  # rope end
+        ],
+        # Site 2
+        [
+            [420.0, 18.0, 255.0],  # rope start
+            [425.0, 18.0, 255.0],  # preamp placement
+            [430.0, 18.0, 255.0],  # rope end
+        ],
+        # Site 3
+        [
+            [435.0, 18.0, 255.0],  # rope start
+            [440.0, 18.0, 255.0],  # preamp placement
+            [445.0, 18.0, 255.0],  # rope end
+        ],
+        # Site 4
+        [
+            [450.0, 18.0, 255.0],  # rope start
+            [455.0, 18.0, 255.0],  # preamp placement
+            [460.0, 18.0, 255.0],  # rope end
+        ],
     ]
     
-    # For full 16x16 grid deployment, uncomment below:
-    # full_grid = generate_grid(
-    #     origin_x=400.0,
-    #     origin_z=250.0,
-    #     y_height=18.0,
-    #     spacing=5.0,
-    #     rows=16,
-    #     cols=16
-    # )
-    # orchestrator.set_deployment_sites(full_grid)
-    
-    # Use debug sites for now
-    orchestrator.set_deployment_sites(debug_sites)
+    orchestrator.set_deployment_sites(row_of_sites)
     
     # ==================== START DEPLOYMENT ====================
     orchestrator.get_logger().info("\n========================================")
