@@ -14,6 +14,7 @@ from rclpy.node import Node
 from driving_package.rover_commander import RoverCommander
 import threading
 import time
+from std_msgs.msg import Empty
 
 
 class DeploymentOrchestrator(Node):
@@ -66,6 +67,7 @@ class DeploymentOrchestrator(Node):
             self.get_logger().info(f"\n{'#'*50}")
             self.get_logger().info(f"### DEPLOYMENT SITE {i+1}/{total_sites} ###")
             self.get_logger().info(f"{'#'*50}")
+
             
             # deploy_grid expects [rope_start, preamp, rope_end]
             antennas_deployed = self.commander.deploy_grid(site)

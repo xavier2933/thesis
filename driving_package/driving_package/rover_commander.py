@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int32, String, Bool
+from std_msgs.msg import Int32, String, Bool, Empty
 from geometry_msgs.msg import PoseArray, Pose, PoseStamped
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -40,6 +40,8 @@ class RoverCommander(Node):
         self.gripper_aut_pub = self.create_publisher(Bool, "/gripper_cmd_aut", 10)
         self.rope_pub = self.create_publisher(Bool, 'rover/deploy_rope', 10)
         self.waypoint_pub = self.create_publisher(Pose, 'rover/waypoint', 10)
+        self.spawn_pub = self.create_publisher(Empty, '/spawn_blocc', 10)
+
         
         # --- Subscribers ---
         self.plate_sub = self.create_subscription(PoseArray, 'rover/plate_locations', self.plate_locations_callback, 10)
@@ -595,6 +597,8 @@ class RoverCommander(Node):
         
         # Reset environment first
         self.reset_environment()
+        self.spawn_pub.publish(Empty())
+        time.sleep(1.0)
         
         try:
             # Refresh TF buffer to handle simulation time reset
