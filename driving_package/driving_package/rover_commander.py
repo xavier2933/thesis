@@ -14,6 +14,28 @@ import time
 import threading
 
 class RoverCommander(Node):
+    # ==================== TUNABLE BLOCK PICKUP OFFSETS ====================
+    # Adjust these values when the object (block) changes
+    
+    # Block pickup offsets (relative to block TF)
+    BLOCK_X_OFFSET = -0.04      # X offset from block center
+    _dy = 398.1286 - 398.0723
+    BLOCK_Y_OFFSET = -0.012 + _dy  # Y offset from block center
+    
+    _dz = 20.12106 - 19.97276 - 0.06
+    
+    # Pickup heights (relative to block Z)
+    APPROACH_HEIGHT = 0.13 + _dz + 0.02    # Height for initial approach
+    GRASP_HEIGHT = 0.07 + _dz + 0.02       # Height for grasping
+    LIFT_HEIGHT = 0.15 + _dz        # Height after lifting
+    
+    # Gripper orientation correction (Euler angles in radians)
+    ORIENTATION_CORRECTION_ROLL = 0.0                # Rotation around X
+    ORIENTATION_CORRECTION_PITCH = -1.57079632679    # -90 degrees around Y
+    ORIENTATION_CORRECTION_YAW = 0.0                 # Rotation around Z
+    
+    # ======================================================================
+    
     def __init__(self):
         super().__init__('rover_commander')
         
@@ -611,27 +633,31 @@ class RoverCommander(Node):
             tf = self.tf_buffer.lookup_transform(self.base_frame, self.block_frame, rclpy.time.Time())
             q_block = [tf.transform.rotation.x, tf.transform.rotation.y, tf.transform.rotation.z, tf.transform.rotation.w]
             
-            # Apply orientation correction (rotate -90 degrees around X)
-            q_correction = quaternion_from_euler(-1.57079632679, 0.0, 0.0)
+            # Apply orientation correction
+            q_correction = quaternion_from_euler(
+                self.ORIENTATION_CORRECTION_ROLL,
+                self.ORIENTATION_CORRECTION_PITCH,
+                self.ORIENTATION_CORRECTION_YAW
+            )
             q_fixed = quaternion_multiply(q_block, q_correction)
             
             # Get block position with offsets
-            tx = tf.transform.translation.x + 0.04
-            ty = tf.transform.translation.y - 0.012
+            tx = tf.transform.translation.x + self.BLOCK_X_OFFSET
+            ty = tf.transform.translation.y + self.BLOCK_Y_OFFSET
             tz = tf.transform.translation.z
             
             # Execute pickup sequence
             self.get_logger().info("📍 Moving to approach position...")
-            self.move_to_pose(tx, ty, tz + 0.13, q_fixed, 3.0)
+            self.move_to_pose(tx, ty, tz + self.APPROACH_HEIGHT, q_fixed, 3.0)
             
             self.get_logger().info("📍 Moving down to grasp position...")
-            self.move_to_pose(tx, ty, tz + 0.07, q_fixed, 3.0)
+            self.move_to_pose(tx, ty, tz + self.GRASP_HEIGHT, q_fixed, 3.0)
             
             self.get_logger().info("✊ Closing gripper...")
             self.control_gripper(False)
             
             self.get_logger().info("📍 Lifting block...")
-            self.move_to_pose(tx, ty, tz + 0.15, q_fixed, 2.0)
+            self.move_to_pose(tx, ty, tz + self.LIFT_HEIGHT, q_fixed, 2.0)
             
             self.get_logger().info("✅ Block pickup complete!")
             
