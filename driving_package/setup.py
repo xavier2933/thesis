@@ -25,6 +25,7 @@ setup(
             'driving_package = driving_package.bt_node:main',
             'rover_commander = driving_package.rover_commander:main',
             'orchestrate_deployment = driving_package.orchestrate_deployment:main',
+            'llm_orchestrator = driving_package.llm_orchestrator:main',
         ],
     },
 )
