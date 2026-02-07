@@ -12,6 +12,7 @@ Usage:
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
+from std_msgs.msg import String, Int32
 from driving_package.rover_commander import RoverCommander
 import json
 import threading
@@ -175,9 +176,20 @@ class LLMOrchestrator(Node):
         
         # Mission state
         self.deployed_sites = []
+        self.deployment_history = []  # [{site_id, success, reason}, ...]
         self.current_obstacles = []  # Future: populated by obstacle detection
         self.mission_active = False
         self.conversation_history = []
+        
+        # Deployment result from Unity
+        self.pending_deployment_result = None
+        self.deployment_site_pub = self.create_publisher(Int32, '/deployment_site_id', 10)
+        self.deployment_result_sub = self.create_subscription(
+            String,
+            '/deployment_result',
+            self.deployment_result_callback,
+            10
+        )
         
         # Ensure log directory exists
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -185,6 +197,24 @@ class LLMOrchestrator(Node):
         
         self.get_logger().info("🤖 LLM Orchestrator initialized")
         self.get_logger().info(f"📁 Logs will be saved to: {LOG_DIR}")
+    
+    def deployment_result_callback(self, msg: String):
+        """Receive deployment validation result from Unity."""
+        # Format: "site_id,success,reason"
+        try:
+            parts = msg.data.split(',', 2)
+            site_id = int(parts[0])
+            success = parts[1].lower() == 'true'
+            reason = parts[2] if len(parts) > 2 else ""
+            
+            self.pending_deployment_result = {
+                "site_id": site_id,
+                "success": success,
+                "reason": reason
+            }
+            self.get_logger().info(f"📥 Received deployment result: site={site_id}, success={success}, reason={reason}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to parse deployment result: {e}")
         
     def get_sites_info(self) -> str:
         """Format site information for the system prompt."""
@@ -242,43 +272,95 @@ class LLMOrchestrator(Node):
         
         self.get_logger().info(f"📍 Deploying at site {site_id}: {waypoint_list}")
         
+        # Publish site_id to Unity BEFORE deployment so it knows which antenna to validate
+        site_msg = Int32()
+        site_msg.data = site_id
+        self.deployment_site_pub.publish(site_msg)
+        self.get_logger().info(f"📤 Published deployment site_id={site_id} to Unity")
+        
+        # Clear any old pending result
+        self.pending_deployment_result = None
+        
         # Execute deployment via RoverCommander
         try:
-            antennas_deployed = self.commander.deploy_grid(waypoint_list)
+            antennas_deployed = self.commander.deploy_grid(waypoint_list, site_id)
+    
+            # Wait for Unity validation result
+            validation_result = self.wait_for_deployment_result(site_id, timeout=45.0)
             
-            if antennas_deployed > 0:
-                self.deployed_sites.append(site_id)
-                
-                # INJECT OBSTACLE after site 1 is deployed
-                if site_id == 1 and not self.current_obstacles:
-                    self.current_obstacles.append({
-                        "id": 1,
-                        "x": 422.0,  # Between site 1 end and site 2 start
-                        "y": 18.0,
-                        "z": 255.0,
-                        "radius": 3.0,
-                        "description": "Large rock blocking path to Site 2"
-                    })
-                    self.get_logger().info("\n" + "!"*50)
-                    self.get_logger().info("🪨 OBSTACLE DETECTED: Large rock at (422, 18, 255)!")
-                    self.get_logger().info("!"*50 + "\n")
-                
+            # Record in deployment history (always, even on failure)
+            self.deployed_sites.append(site_id)
+            self.deployment_history.append({
+                "site_id": site_id,
+                "rover_success": antennas_deployed > 0,
+                "validation": validation_result
+            })
+            
+            # INJECT OBSTACLE after site 1 is deployed (for testing)
+            if site_id == 1 and not self.current_obstacles:
+                self.current_obstacles.append({
+                    "id": 1,
+                    "x": 422.0,  # Between site 1 end and site 2 start
+                    "y": 18.0,
+                    "z": 255.0,
+                    "radius": 3.0,
+                    "description": "Large rock blocking path to Site 2"
+                })
+                self.get_logger().info("\n" + "!"*50)
+                self.get_logger().info("🪨 OBSTACLE DETECTED: Large rock at (422, 18, 255)!")
+                self.get_logger().info("!"*50 + "\n")
+            
+            # Build response
+            if validation_result and validation_result.get("success"):
                 return json.dumps({
                     "success": True,
-                    "message": f"Site {site_id} deployed successfully. {antennas_deployed} antenna(s) placed.",
+                    "message": f"Site {site_id} deployed and validated successfully.",
+                    "validation": validation_result.get("reason", ""),
                     "deployed_sites": self.deployed_sites,
                     "warning": "OBSTACLE DETECTED ahead! A large rock is blocking the path to Site 2. You must navigate around it before continuing." if site_id == 1 and self.current_obstacles else None
                 })
-            else:
+            elif validation_result:
                 return json.dumps({
                     "success": False,
-                    "error": f"Deployment at site {site_id} failed - no antennas placed"
+                    "message": f"Site {site_id} deployment FAILED validation.",
+                    "reason": validation_result.get("reason", "Unknown"),
+                    "deployed_sites": self.deployed_sites,
+                    "note": "Continue to next site despite failure."
                 })
+            else:
+                return json.dumps({
+                    "success": True,
+                    "message": f"Site {site_id} physically deployed ({antennas_deployed} antenna(s)), but no validation received from Unity.",
+                    "deployed_sites": self.deployed_sites,
+                    "warning": "OBSTACLE DETECTED ahead!" if site_id == 1 and self.current_obstacles else None
+                })
+                
         except Exception as e:
+            self.deployment_history.append({
+                "site_id": site_id,
+                "rover_success": False,
+                "validation": {"success": False, "reason": str(e)}
+            })
             return json.dumps({
                 "success": False,
                 "error": f"Deployment error: {str(e)}"
             })
+    
+    def wait_for_deployment_result(self, site_id: int, timeout: float = 10.0) -> dict:
+        """Wait for Unity to send deployment validation result."""
+        self.get_logger().info(f"⏳ Waiting for Unity validation (timeout={timeout}s)...")
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self.pending_deployment_result and self.pending_deployment_result.get("site_id") == site_id:
+                result = self.pending_deployment_result
+                self.pending_deployment_result = None
+                return result
+            time.sleep(0.1)
+        
+        self.get_logger().warn(f"⚠️ Timeout waiting for validation result for site {site_id}")
+        return None
+
     
     def tool_get_mission_status(self) -> str:
         """Return current mission status."""

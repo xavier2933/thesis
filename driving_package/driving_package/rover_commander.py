@@ -63,6 +63,7 @@ class RoverCommander(Node):
         self.rope_pub = self.create_publisher(Bool, 'rover/deploy_rope', 10)
         self.waypoint_pub = self.create_publisher(Pose, 'rover/waypoint', 10)
         self.spawn_pub = self.create_publisher(Empty, '/spawn_blocc', 10)
+        self.placement_complete_pub = self.create_publisher(Int32, '/placement_complete', 10)
 
         
         # --- Subscribers ---
@@ -184,7 +185,7 @@ class RoverCommander(Node):
         state = "STARTED" if deploying else "STOPPED"
         self.get_logger().info(f"🪢 Rope deployment {state}")
     
-    def deploy_grid(self, sites: list) -> int:
+    def deploy_grid(self, sites: list, site_id: int = 0) -> int:
         """
         Deploy antennas at multiple sites in sequence.
         
@@ -195,6 +196,7 @@ class RoverCommander(Node):
         
         Args:
             sites: List of [x, y, z] coordinates (minimum 3 required)
+            site_id: The site identifier for deployment validation (passed to Unity)
             
         Returns:
             Number of successfully deployed antennas (middle waypoints only)
@@ -243,9 +245,14 @@ class RoverCommander(Node):
                     success_count += 1
                 else:
                     self.get_logger().error(f"Pick and place failed at site {i+1}")
+
             
             # Last waypoint: Stop rope
             elif is_last:
+                msg = Int32()
+                msg.data = site_id
+                self.placement_complete_pub.publish(msg)
+                self.get_logger().info(f"📤 [ROVER] Sent placement_complete for Site {site_id}")
                 self.get_logger().info("Stopping rope deployment...")
                 self.set_rope(False)
         
@@ -387,6 +394,7 @@ class RoverCommander(Node):
             # 3. Open Gripper
             self.get_logger().info("👐 Releasing block...")
             self.control_gripper(True)
+            
 
             # 4. Retract Arm
             self.get_logger().info("📍 Retracting arm...")

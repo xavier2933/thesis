@@ -69,8 +69,8 @@ class DeploymentOrchestrator(Node):
             self.get_logger().info(f"{'#'*50}")
 
             
-            # deploy_grid expects [rope_start, preamp, rope_end]
-            antennas_deployed = self.commander.deploy_grid(site)
+            # deploy_grid expects [rope_start, preamp, rope_end] and site_id
+            antennas_deployed = self.commander.deploy_grid(site, site_id=i+1)
             
             if antennas_deployed > 0:
                 successful_sites += 1
