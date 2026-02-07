@@ -117,7 +117,23 @@ TOOLS = [
             }
         }
     },
-    # Future: avoid_obstacle tool will be added here
+    {
+        "type": "function",
+        "function": {
+            "name": "go_around_obstacle",
+            "description": "Navigate the rover around a detected obstacle. Use this when an obstacle is blocking the path to the next deployment site. The rover will autonomously find a safe path around the obstacle.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "obstacle_id": {
+                        "type": "integer",
+                        "description": "The ID of the obstacle to navigate around"
+                    }
+                },
+                "required": ["obstacle_id"]
+            }
+        }
+    },
 ]
 
 SYSTEM_PROMPT = """You are an autonomous rover mission planner for lunar antenna deployment.
@@ -232,10 +248,26 @@ class LLMOrchestrator(Node):
             
             if antennas_deployed > 0:
                 self.deployed_sites.append(site_id)
+                
+                # INJECT OBSTACLE after site 1 is deployed
+                if site_id == 1 and not self.current_obstacles:
+                    self.current_obstacles.append({
+                        "id": 1,
+                        "x": 422.0,  # Between site 1 end and site 2 start
+                        "y": 18.0,
+                        "z": 255.0,
+                        "radius": 3.0,
+                        "description": "Large rock blocking path to Site 2"
+                    })
+                    self.get_logger().info("\n" + "!"*50)
+                    self.get_logger().info("🪨 OBSTACLE DETECTED: Large rock at (422, 18, 255)!")
+                    self.get_logger().info("!"*50 + "\n")
+                
                 return json.dumps({
                     "success": True,
                     "message": f"Site {site_id} deployed successfully. {antennas_deployed} antenna(s) placed.",
-                    "deployed_sites": self.deployed_sites
+                    "deployed_sites": self.deployed_sites,
+                    "warning": "OBSTACLE DETECTED ahead! A large rock is blocking the path to Site 2. You must navigate around it before continuing." if site_id == 1 and self.current_obstacles else None
                 })
             else:
                 return json.dumps({
@@ -274,6 +306,36 @@ class LLMOrchestrator(Node):
             "final_deployed_sites": self.deployed_sites
         })
     
+    def tool_go_around_obstacle(self, obstacle_id: int) -> str:
+        """Simulate navigating around an obstacle."""
+        self.get_logger().info(f"🪨 LLM requested: go_around_obstacle(obstacle_id={obstacle_id})")
+        
+        # Find the obstacle
+        obstacle = None
+        for o in self.current_obstacles:
+            if o["id"] == obstacle_id:
+                obstacle = o
+                break
+        
+        if not obstacle:
+            return json.dumps({
+                "success": False,
+                "error": f"No obstacle with id {obstacle_id} found"
+            })
+        
+        # Simulate going around (does nothing for now)
+        self.get_logger().info(f"🚧 Navigating around obstacle: {obstacle['description']}")
+        time.sleep(1.0)  # Simulate some navigation time
+        
+        # Mark obstacle as cleared
+        self.current_obstacles.remove(obstacle)
+        
+        return json.dumps({
+            "success": True,
+            "message": f"Successfully navigated around the obstacle at ({obstacle['x']}, {obstacle['y']}, {obstacle['z']}). Path is now clear.",
+            "remaining_obstacles": len(self.current_obstacles)
+        })
+    
     def execute_tool(self, tool_name: str, arguments: dict) -> str:
         """Route tool calls to implementations."""
         if tool_name == "deploy_antenna":
@@ -282,6 +344,8 @@ class LLMOrchestrator(Node):
             return self.tool_get_mission_status()
         elif tool_name == "mission_complete":
             return self.tool_mission_complete(arguments.get("summary", ""))
+        elif tool_name == "go_around_obstacle":
+            return self.tool_go_around_obstacle(arguments["obstacle_id"])
         else:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
     
