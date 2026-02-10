@@ -13,6 +13,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.executors import MultiThreadedExecutor
 from std_msgs.msg import String, Int32
+from geometry_msgs.msg import Pose
 from driving_package.rover_commander import RoverCommander
 import json
 import threading
@@ -190,6 +191,9 @@ class LLMOrchestrator(Node):
             self.deployment_result_callback,
             10
         )
+        
+        # Curved goal publisher for obstacle avoidance
+        self.curved_goal_pub = self.create_publisher(Pose, '/rover/curved_goal', 10)
         
         # Ensure log directory exists
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -389,7 +393,7 @@ class LLMOrchestrator(Node):
         })
     
     def tool_go_around_obstacle(self, obstacle_id: int) -> str:
-        """Simulate navigating around an obstacle."""
+        """Navigate around an obstacle using two Bezier curve goals."""
         self.get_logger().info(f"🪨 LLM requested: go_around_obstacle(obstacle_id={obstacle_id})")
         
         # Find the obstacle
@@ -405,18 +409,69 @@ class LLMOrchestrator(Node):
                 "error": f"No obstacle with id {obstacle_id} found"
             })
         
-        # Simulate going around (does nothing for now)
+        obs_x, obs_y, obs_z = obstacle['x'], obstacle['y'], obstacle['z']
+        radius = obstacle.get('radius', 3.0)
+        offset = 2.0  # meters to swerve left (negative Z in Unity)
+        
+        # Avoidance waypoint: 2m to the left of the obstacle center
+        avoid_x = obs_x
+        avoid_y = obs_y
+        avoid_z = obs_z - offset  # Left = -Z in Unity world
+        
+        # Travel heading (rover moves along +X axis between sites)
+        travel_heading = 90.0  # degrees, facing +X in Unity
+        
         self.get_logger().info(f"🚧 Navigating around obstacle: {obstacle['description']}")
-        time.sleep(1.0)  # Simulate some navigation time
+        self.get_logger().info(f"   Curve 1: swerve to ({avoid_x}, {avoid_y}, {avoid_z})")
+        
+        # === Curve 1: current position → avoidance point (swerve left) ===
+        self._publish_curved_goal(avoid_x, avoid_y, avoid_z, travel_heading, is_final=False)
+        arrived1 = self.commander.wait_for_unity_arrival(timeout=30.0)
+        
+        if not arrived1:
+            self.get_logger().warn("⚠️ Timeout on curve 1 (swerve), continuing anyway")
+        
+        # === Curve 2: avoidance point → rejoin original line past obstacle ===
+        rejoin_x = obs_x + radius + 2.0  # Past the obstacle
+        rejoin_z = obs_z  # Back on original line
+        
+        self.get_logger().info(f"   Curve 2: rejoin at ({rejoin_x}, {obs_y}, {rejoin_z})")
+        self._publish_curved_goal(rejoin_x, obs_y, rejoin_z, travel_heading, is_final=True)
+        arrived2 = self.commander.wait_for_unity_arrival(timeout=30.0)
+        
+        if not arrived2:
+            self.get_logger().warn("⚠️ Timeout on curve 2 (rejoin), continuing anyway")
         
         # Mark obstacle as cleared
         self.current_obstacles.remove(obstacle)
         
         return json.dumps({
             "success": True,
-            "message": f"Successfully navigated around the obstacle at ({obstacle['x']}, {obstacle['y']}, {obstacle['z']}). Path is now clear.",
+            "message": f"Successfully navigated around the obstacle at ({obs_x}, {obs_y}, {obs_z}). Path is now clear.",
+            "avoidance_point": [avoid_x, avoid_y, avoid_z],
+            "rejoin_point": [rejoin_x, obs_y, rejoin_z],
             "remaining_obstacles": len(self.current_obstacles)
         })
+    
+    def _publish_curved_goal(self, x, y, z, end_heading, is_final=False):
+        """Publish a curved goal to Unity via /rover/curved_goal.
+        
+        Pose fields:
+          position.x/y/z  = end point (Unity world coords)
+          orientation.z    = end heading in degrees
+          orientation.w    = 1.0 if final curve in sequence, 0.0 otherwise
+        """
+        msg = Pose()
+        msg.position.x = float(x)
+        msg.position.y = float(y)
+        msg.position.z = float(z)
+        msg.orientation.z = float(end_heading)
+        msg.orientation.w = 1.0 if is_final else 0.0
+        self.curved_goal_pub.publish(msg)
+        self.get_logger().info(
+            f"📤 Published curved goal: ({x}, {y}, {z}), "
+            f"heading={end_heading}°, final={is_final}"
+        )
     
     def execute_tool(self, tool_name: str, arguments: dict) -> str:
         """Route tool calls to implementations."""
