@@ -168,12 +168,16 @@ class LLMOrchestrator(Node):
     def __init__(self):
         super().__init__('llm_orchestrator')
         
+        # ROS parameters
+        self.declare_parameter('debug_mode', False)
+        self.debug_mode = self.get_parameter('debug_mode').value
+        
         # Initialize OpenAI client
         self.client = OpenAI()
         self.model = "gpt-5-nano"  # Can change to gpt-4o-mini for faster/cheaper
         
-        # Initialize RoverCommander
-        self.commander = RoverCommander()
+        # Initialize RoverCommander (pass debug_mode to skip arm operations)
+        self.commander = RoverCommander(debug_mode=self.debug_mode)
         self.commander.sequence_started = True  # Prevent auto-start
         
         # Mission state
@@ -211,6 +215,8 @@ class LLMOrchestrator(Node):
         
         self.get_logger().info("🤖 LLM Orchestrator initialized")
         self.get_logger().info(f"📁 Logs will be saved to: {LOG_DIR}")
+        if self.debug_mode:
+            self.get_logger().info("⚡ DEBUG MODE: arm operations will be skipped in RoverCommander")
     
     def deployment_result_callback(self, msg: String):
         """Receive deployment validation result from Unity."""
@@ -334,7 +340,10 @@ class LLMOrchestrator(Node):
             antennas_deployed = self.commander.deploy_grid(waypoint_list, site_id)
     
             # Wait for Unity validation result
-            validation_result = self.wait_for_deployment_result(site_id, timeout=45.0)
+            if self.debug_mode:
+                validation_result = {"success": True, "reason": "debug_mode: validation skipped"}
+            else:
+                validation_result = self.wait_for_deployment_result(site_id, timeout=45.0)
             
             # Record in deployment history (always, even on failure)
             self.deployed_sites.append(site_id)

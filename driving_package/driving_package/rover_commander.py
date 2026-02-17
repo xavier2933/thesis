@@ -36,8 +36,9 @@ class RoverCommander(Node):
     
     # ======================================================================
     
-    def __init__(self):
+    def __init__(self, debug_mode=False):
         super().__init__('rover_commander')
+        self.debug_mode = debug_mode
         
         # --- Arm Control Config ---
         self.base_frame = "panda_link0"
@@ -81,6 +82,8 @@ class RoverCommander(Node):
         self.sequence_started = False 
 
         self.get_logger().info("[ROVER] Commander node initialized")
+        if self.debug_mode:
+            self.get_logger().info("[ROVER] ⚡ DEBUG MODE: arm pick-and-place will be skipped")
         
         self.get_logger().info("[ROVER] Waiting for plate locations from Unity...")
 
@@ -240,11 +243,15 @@ class RoverCommander(Node):
             
             # Middle waypoints: Pick and Place
             elif is_middle:
-                self.get_logger().info("Executing pick and place...")
-                if self.deploy_antenna_at_current_site():
+                if self.debug_mode:
+                    self.get_logger().info("⚡ DEBUG: Skipping pick and place (simulated success)")
                     success_count += 1
                 else:
-                    self.get_logger().error(f"Pick and place failed at site {i+1}")
+                    self.get_logger().info("Executing pick and place...")
+                    if self.deploy_antenna_at_current_site():
+                        success_count += 1
+                    else:
+                        self.get_logger().error(f"Pick and place failed at site {i+1}")
 
             
             # Last waypoint: Stop rope
