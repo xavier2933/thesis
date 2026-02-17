@@ -16,6 +16,7 @@ from std_msgs.msg import String, Int32
 from geometry_msgs.msg import Pose
 from driving_package.rover_commander import RoverCommander
 import json
+import re
 import threading
 import time
 import os
@@ -178,7 +179,8 @@ class LLMOrchestrator(Node):
         # Mission state
         self.deployed_sites = []
         self.deployment_history = []  # [{site_id, success, reason}, ...]
-        self.current_obstacles = []  # Future: populated by obstacle detection
+        self.current_obstacles = []  # Populated by /rock_detection subscriber
+        self._next_obstacle_id = 1
         self.mission_active = False
         self.conversation_history = []
         
@@ -189,6 +191,14 @@ class LLMOrchestrator(Node):
             String,
             '/deployment_result',
             self.deployment_result_callback,
+            10
+        )
+        
+        # Rock detection subscriber
+        self.rock_detection_sub = self.create_subscription(
+            String,
+            '/rock_detection',
+            self.rock_detection_callback,
             10
         )
         
@@ -219,6 +229,40 @@ class LLMOrchestrator(Node):
             self.get_logger().info(f"📥 Received deployment result: site={site_id}, success={success}, reason={reason}")
         except Exception as e:
             self.get_logger().error(f"Failed to parse deployment result: {e}")
+    
+    def rock_detection_callback(self, msg: String):
+        """Receive rock detection from Unity and add to obstacles list.
+        
+        Expected format: 'Rock at (x, y, z) detected!'
+        """
+        try:
+            match = re.search(r'\(([\d.]+),\s*([\d.]+),\s*([\d.]+)\)', msg.data)
+            if not match:
+                self.get_logger().warn(f"Could not parse rock position from: {msg.data}")
+                return
+            
+            x, y, z = float(match.group(1)), float(match.group(2)), float(match.group(3))
+            
+            # Check for duplicates (within 2m of an existing obstacle)
+            for o in self.current_obstacles:
+                dist = ((o['x'] - x)**2 + (o['y'] - y)**2 + (o['z'] - z)**2) ** 0.5
+                if dist < 2.0:
+                    return  # Already tracked
+            
+            obstacle = {
+                "id": self._next_obstacle_id,
+                "x": x,
+                "y": y,
+                "z": z,
+                "radius": 3.0,
+                "description": f"Rock detected at ({x}, {y}, {z})"
+            }
+            self._next_obstacle_id += 1
+            self.current_obstacles.append(obstacle)
+            
+            self.get_logger().info(f"🪨 Rock detected! Added obstacle id={obstacle['id']} at ({x}, {y}, {z})")
+        except Exception as e:
+            self.get_logger().error(f"Failed to parse rock detection: {e}")
         
     def get_sites_info(self) -> str:
         """Format site information for the system prompt."""
@@ -237,7 +281,7 @@ class LLMOrchestrator(Node):
         if not self.current_obstacles:
             return "None detected"
         return "\n".join([
-            f"- Obstacle at ({o['x']}, {o['y']}, {o['z']}) with radius {o['radius']}m"
+            f"- Obstacle id={o['id']}: {o['description']} (radius {o['radius']}m)"
             for o in self.current_obstacles
         ])
     
@@ -300,28 +344,20 @@ class LLMOrchestrator(Node):
                 "validation": validation_result
             })
             
-            # INJECT OBSTACLE after site 1 is deployed (for testing)
-            if site_id == 1 and not self.current_obstacles:
-                self.current_obstacles.append({
-                    "id": 1,
-                    "x": 422.0,  # Between site 1 end and site 2 start
-                    "y": 18.0,
-                    "z": 255.0,
-                    "radius": 3.0,
-                    "description": "Large rock blocking path to Site 2"
-                })
-                self.get_logger().info("\n" + "!"*50)
-                self.get_logger().info("🪨 OBSTACLE DETECTED: Large rock at (422, 18, 255)!")
-                self.get_logger().info("!"*50 + "\n")
-            
+
             # Build response
+            obstacle_warning = None
+            if self.current_obstacles:
+                obstacle_warning = (f"{len(self.current_obstacles)} obstacle(s) detected on the field. "
+                                    f"Check mission status for details and use go_around_obstacle if one is blocking your path.")
+            
             if validation_result and validation_result.get("success"):
                 return json.dumps({
                     "success": True,
                     "message": f"Site {site_id} deployed and validated successfully.",
                     "validation": validation_result.get("reason", ""),
                     "deployed_sites": self.deployed_sites,
-                    "warning": "OBSTACLE DETECTED ahead! A large rock is blocking the path to Site 2. You must navigate around it before continuing." if site_id == 1 and self.current_obstacles else None
+                    "warning": obstacle_warning
                 })
             elif validation_result:
                 return json.dumps({
@@ -336,7 +372,7 @@ class LLMOrchestrator(Node):
                     "success": True,
                     "message": f"Site {site_id} physically deployed ({antennas_deployed} antenna(s)), but no validation received from Unity.",
                     "deployed_sites": self.deployed_sites,
-                    "warning": "OBSTACLE DETECTED ahead!" if site_id == 1 and self.current_obstacles else None
+                    "warning": obstacle_warning
                 })
                 
         except Exception as e:
