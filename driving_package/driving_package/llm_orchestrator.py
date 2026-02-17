@@ -124,16 +124,21 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "go_around_obstacle",
-            "description": "Navigate the rover around a detected obstacle. Use this when an obstacle is blocking the path to the next deployment site. The rover will autonomously find a safe path around the obstacle.",
+            "description": "Navigate the rover around a detected obstacle using curved paths. Only use this if the obstacle is AHEAD of the rover (obstacle X > rover X). Choose left or right based on which side has more clearance.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "obstacle_id": {
                         "type": "integer",
                         "description": "The ID of the obstacle to navigate around"
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["left", "right"],
+                        "description": "Which side to swerve around the obstacle. In Unity coordinates: left = -Z, right = +Z."
                     }
                 },
-                "required": ["obstacle_id"]
+                "required": ["obstacle_id", "direction"]
             }
         }
     },
@@ -147,6 +152,9 @@ Deploy antennas at 4 sites in sequence. Each site requires:
 2. Navigate to preamp location and place the antenna
 3. Navigate to rope_end and stop deploying rope
 
+ROVER POSITION:
+{rover_position}
+
 AVAILABLE SITES:
 {sites_info}
 
@@ -156,7 +164,9 @@ CURRENT OBSTACLES:
 RULES:
 - Deploy sites in order (1 -> 2 -> 3 -> 4) unless blocked by obstacles
 - After each deployment, check the mission status
-- If an obstacle is detected, you may need to adjust the plan
+- The rover travels along the +X axis. Only go around obstacles that are AHEAD (obstacle X > rover X)
+- If an obstacle is behind you (obstacle X < rover X), ignore it
+- When avoiding obstacles, choose left (-Z) or right (+Z) based on clearance
 - Call mission_complete when all sites are deployed
 
 Think step by step. After each action, evaluate the result and decide the next step."""
@@ -293,7 +303,9 @@ class LLMOrchestrator(Node):
     
     def build_system_prompt(self) -> str:
         """Build the system prompt with current state."""
+        pos = self.commander.rover_position
         return SYSTEM_PROMPT.format(
+            rover_position=f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}) — traveling along +X axis",
             sites_info=self.get_sites_info(),
             obstacles_info=self.get_obstacles_info()
         )
@@ -437,9 +449,9 @@ class LLMOrchestrator(Node):
             "final_deployed_sites": self.deployed_sites
         })
     
-    def tool_go_around_obstacle(self, obstacle_id: int) -> str:
+    def tool_go_around_obstacle(self, obstacle_id: int, direction: str = "left") -> str:
         """Navigate around an obstacle using two Bezier curve goals."""
-        self.get_logger().info(f"🪨 LLM requested: go_around_obstacle(obstacle_id={obstacle_id})")
+        self.get_logger().info(f"🪨 LLM requested: go_around_obstacle(obstacle_id={obstacle_id}, direction={direction})")
         
         # Find the obstacle
         obstacle = None
@@ -455,21 +467,38 @@ class LLMOrchestrator(Node):
             })
         
         obs_x, obs_y, obs_z = obstacle['x'], obstacle['y'], obstacle['z']
-        radius = obstacle.get('radius', 3.0)
-        offset = 2.0  # meters to swerve left (negative Z in Unity)
+        rover_x = self.commander.rover_position[0]
         
-        # Avoidance waypoint: 2m to the left of the obstacle center
+        # Check if obstacle is behind the rover (already passed)
+        if obs_x < rover_x - 2.0:
+            self.get_logger().info(f"⏭️ Obstacle {obstacle_id} is behind the rover (obs_x={obs_x:.1f} < rover_x={rover_x:.1f}), skipping")
+            self.current_obstacles.remove(obstacle)
+            return json.dumps({
+                "success": True,
+                "message": f"Obstacle at ({obs_x}, {obs_y}, {obs_z}) is behind the rover — already passed. Removed from tracking.",
+                "remaining_obstacles": len(self.current_obstacles)
+            })
+        
+        radius = obstacle.get('radius', 3.0)
+        offset = 2.0  # meters to swerve sideways
+        
+        # Swerve direction: left = -Z, right = +Z in Unity
+        if direction == "right":
+            avoid_z = obs_z + offset
+        else:
+            avoid_z = obs_z - offset
+        
         avoid_x = obs_x
         avoid_y = obs_y
-        avoid_z = obs_z - offset  # Left = -Z in Unity world
         
         # Travel heading (rover moves along +X axis between sites)
         travel_heading = 90.0  # degrees, facing +X in Unity
         
         self.get_logger().info(f"🚧 Navigating around obstacle: {obstacle['description']}")
+        self.get_logger().info(f"   Direction: {direction}")
         self.get_logger().info(f"   Curve 1: swerve to ({avoid_x}, {avoid_y}, {avoid_z})")
         
-        # === Curve 1: current position → avoidance point (swerve left) ===
+        # === Curve 1: current position → avoidance point (swerve) ===
         self._publish_curved_goal(avoid_x, avoid_y, avoid_z, travel_heading, is_final=False)
         arrived1 = self.commander.wait_for_unity_arrival(timeout=30.0)
         
@@ -492,7 +521,8 @@ class LLMOrchestrator(Node):
         
         return json.dumps({
             "success": True,
-            "message": f"Successfully navigated around the obstacle at ({obs_x}, {obs_y}, {obs_z}). Path is now clear.",
+            "message": f"Successfully navigated around the obstacle at ({obs_x}, {obs_y}, {obs_z}) going {direction}. Path is now clear.",
+            "direction": direction,
             "avoidance_point": [avoid_x, avoid_y, avoid_z],
             "rejoin_point": [rejoin_x, obs_y, rejoin_z],
             "remaining_obstacles": len(self.current_obstacles)
@@ -527,7 +557,7 @@ class LLMOrchestrator(Node):
         elif tool_name == "mission_complete":
             return self.tool_mission_complete(arguments.get("summary", ""))
         elif tool_name == "go_around_obstacle":
-            return self.tool_go_around_obstacle(arguments["obstacle_id"])
+            return self.tool_go_around_obstacle(arguments["obstacle_id"], arguments.get("direction", "left"))
         else:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
     
