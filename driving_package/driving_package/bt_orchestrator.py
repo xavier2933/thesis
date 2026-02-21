@@ -223,10 +223,6 @@ class _MarkDeployed(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
-
 def main(args=None):
     rclpy.init(args=args)
 
