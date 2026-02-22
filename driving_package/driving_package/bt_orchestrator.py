@@ -105,6 +105,10 @@ class DeploySite(py_trees.behaviour.Behaviour):
             self._result = 0
 
 
+class TurnAround(py_trees.behaviour.Behaviour):
+    def __init__(self):
+        super().__init__("TurnAround")
+
 class MissionComplete(py_trees.behaviour.Behaviour):
     """Leaf node that logs mission summary and always returns SUCCESS."""
 
@@ -124,6 +128,59 @@ class MissionComplete(py_trees.behaviour.Behaviour):
         return py_trees.common.Status.SUCCESS
 
 
+class TurnAround(py_trees.behaviour.Behaviour):
+    """Navigate the rover to a specified return point.
+
+    Dispatches the blocking go_to_site call to a background thread
+    (same pattern as DeploySite) and returns RUNNING until it finishes.
+    """
+
+    def __init__(self, target: list, commander: RoverCommander, logger):
+        super().__init__("TurnAround")
+        self.target = target          # [x, y, z]
+        self.commander = commander
+        self._logger = logger
+
+        self._thread = None
+        self._success = None          # None = not started
+
+    def initialise(self):
+        self._success = None
+        self._thread = None
+        x, y, z = self.target
+        self._logger.info(
+            f"🔄 BT: Turning around — heading to ({x}, {y}, {z})"
+        )
+        self._thread = threading.Thread(
+            target=self._navigate, daemon=True
+        )
+        self._thread.start()
+
+    def update(self):
+        if self._thread is not None and self._thread.is_alive():
+            return py_trees.common.Status.RUNNING
+
+        if self._success:
+            self._logger.info("✅ BT: Arrived at return point")
+            return py_trees.common.Status.SUCCESS
+
+        self._logger.error("❌ BT: Failed to reach return point")
+        return py_trees.common.Status.FAILURE
+
+    def terminate(self, new_status):
+        pass
+
+    def _navigate(self):
+        try:
+            x, y, z = self.target
+            self._success = self.commander.go_to_site(x, y, z)
+        except Exception as e:
+            self._logger.error(
+                f"💥 BT: Exception during turn-around: {e}"
+            )
+            self._success = False
+
+
 # ============================================================================
 # ROS 2 NODE
 # ============================================================================
@@ -136,7 +193,15 @@ class BTOrchestrator(Node):
 
         # Parameters
         self.declare_parameter("debug_mode", False)
+        self.declare_parameter(
+            "return_point", [400.0, 18.0, 255.0]
+        )
         debug_mode = self.get_parameter("debug_mode").value
+        self.return_point = (
+            self.get_parameter("return_point")
+            .get_parameter_value()
+            .double_array_value
+        )
 
         # RoverCommander (same pattern as orchestrate_deployment.py)
         self.commander = RoverCommander(debug_mode=debug_mode)
@@ -155,6 +220,9 @@ class BTOrchestrator(Node):
         self.tick_timer = self.create_timer(0.5, self._tick)
 
         self.get_logger().info("🌳 BT Orchestrator initialized")
+        self.get_logger().info(
+            f"📍 Return point: {list(self.return_point)}"
+        )
         if debug_mode:
             self.get_logger().info(
                 "⚡ DEBUG MODE: arm operations skipped in RoverCommander"
@@ -186,6 +254,14 @@ class BTOrchestrator(Node):
 
         root.add_child(
             MissionComplete(self.deployed_sites, self.get_logger())
+        )
+
+        root.add_child(
+            TurnAround(
+                target=list(self.return_point),
+                commander=self.commander,
+                logger=self.get_logger(),
+            )
         )
 
         return py_trees.trees.BehaviourTree(root)
