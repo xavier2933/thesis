@@ -30,10 +30,19 @@ LOG_DIR = os.path.expanduser("~/thesis_ws/llm_logs")
 # MISSION CONFIGURATION
 # ============================================================================
 
+ROW_SPACING_Z = 15.0   # meters between rows in +Z
+BASE_Z = 255.0
+
+DEPLOYMENT_ROWS = [
+    {"row_id": 0, "direction": +1, "z": BASE_Z,                   "heading": 90.0},   # +X travel
+    {"row_id": 1, "direction": -1, "z": BASE_Z + ROW_SPACING_Z,   "heading": 270.0},  # -X travel
+]
+
 DEPLOYMENT_SITES = [
+    # ── Row 0: Z=255, traveling +X (rope_start.x < rope_end.x) ──
     {
-        "site_id": 1,
-        "description": "Site 1 - First antenna in the row",
+        "site_id": 1, "row": 0,
+        "description": "Row 0, Site 1 — first antenna",
         "waypoints": {
             "rope_start": [405.0, 18.0, 255.0],
             "preamp": [410.0, 18.0, 255.0],
@@ -41,8 +50,8 @@ DEPLOYMENT_SITES = [
         }
     },
     {
-        "site_id": 2,
-        "description": "Site 2 - Second antenna in the row",
+        "site_id": 2, "row": 0,
+        "description": "Row 0, Site 2 — second antenna",
         "waypoints": {
             "rope_start": [420.0, 18.0, 255.0],
             "preamp": [425.0, 18.0, 255.0],
@@ -50,8 +59,8 @@ DEPLOYMENT_SITES = [
         }
     },
     {
-        "site_id": 3,
-        "description": "Site 3 - Third antenna in the row",
+        "site_id": 3, "row": 0,
+        "description": "Row 0, Site 3 — third antenna",
         "waypoints": {
             "rope_start": [435.0, 18.0, 255.0],
             "preamp": [440.0, 18.0, 255.0],
@@ -59,12 +68,49 @@ DEPLOYMENT_SITES = [
         }
     },
     {
-        "site_id": 4,
-        "description": "Site 4 - Fourth antenna in the row",
+        "site_id": 4, "row": 0,
+        "description": "Row 0, Site 4 — fourth antenna",
         "waypoints": {
             "rope_start": [450.0, 18.0, 255.0],
             "preamp": [455.0, 18.0, 255.0],
             "rope_end": [460.0, 18.0, 255.0],
+        }
+    },
+    # ── Row 1: Z=270, traveling -X (rope_start.x > rope_end.x) ──
+    {
+        "site_id": 5, "row": 1,
+        "description": "Row 1, Site 5 — first antenna (reverse)",
+        "waypoints": {
+            "rope_start": [460.0, 18.0, 270.0],
+            "preamp": [455.0, 18.0, 270.0],
+            "rope_end": [450.0, 18.0, 270.0],
+        }
+    },
+    {
+        "site_id": 6, "row": 1,
+        "description": "Row 1, Site 6 — second antenna (reverse)",
+        "waypoints": {
+            "rope_start": [445.0, 18.0, 270.0],
+            "preamp": [440.0, 18.0, 270.0],
+            "rope_end": [435.0, 18.0, 270.0],
+        }
+    },
+    {
+        "site_id": 7, "row": 1,
+        "description": "Row 1, Site 7 — third antenna (reverse)",
+        "waypoints": {
+            "rope_start": [430.0, 18.0, 270.0],
+            "preamp": [425.0, 18.0, 270.0],
+            "rope_end": [420.0, 18.0, 270.0],
+        }
+    },
+    {
+        "site_id": 8, "row": 1,
+        "description": "Row 1, Site 8 — fourth antenna (reverse)",
+        "waypoints": {
+            "rope_start": [415.0, 18.0, 270.0],
+            "preamp": [410.0, 18.0, 270.0],
+            "rope_end": [405.0, 18.0, 270.0],
         }
     },
 ]
@@ -220,6 +266,18 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "turn_around",
+            "description": "Execute a U-turn to the next deployment row. Uses two curved waypoints for a smooth turn. Call this AFTER completing (or aborting) all sites in the current row. The rover will navigate to the start of the next row and flip travel direction.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
 ]
 
 SYSTEM_PROMPT = """You are an autonomous rover mission planner for lunar antenna deployment.
@@ -230,7 +288,10 @@ IMPORTANT: Before EVERY tool call, you MUST provide a brief text explanation of:
 This reasoning is logged for mission review. Never make a tool call without explaining your thinking first.
 
 MISSION OBJECTIVE:
-Deploy antennas at 4 sites in sequence along the +X axis.
+Deploy antennas at {total_sites} sites across {total_rows} rows in an S-pattern.
+- Row 0: travel in +X direction (sites 1–4)
+- Row 1: travel in -X direction (sites 5–8)
+After completing all sites in a row, call turn_around() to move to the next row.
 
 DEPLOYMENT SEQUENCE (for each site):
 1. get_adjusted_site_waypoints(site_id) — get waypoints (auto-adjusts if rover overshot start)
@@ -240,6 +301,10 @@ DEPLOYMENT SEQUENCE (for each site):
 5. pick_and_place()                     — place the antenna
 6. navigate_to_waypoint(rope_end)       — drive to the rope end position (while laying rope)
 7. stop_rope(site_id)                   — stop rope and finalize site
+
+ROW TRANSITION:
+After completing the last site in a row, call turn_around() to perform a U-turn
+to the next row. The turn_around handles navigation and direction switching.
 
 You MUST call each step individually. Between any two steps you may check
 mission status or handle obstacles.
@@ -268,14 +333,14 @@ CURRENT OBSTACLES:
 {obstacles_info}
 
 RULES:
-- Deploy sites in order (1 -> 2 -> 3 -> 4) unless blocked by obstacles
+- Deploy sites in the order listed for each row
 - navigate_to_waypoint will REFUSE to navigate if an obstacle is in the path — you MUST call go_around_obstacle first to clear it
-- The rover travels along the +X axis. Only go around obstacles that are AHEAD (obstacle X > rover X)
-- If an obstacle is behind you (obstacle X < rover X), ignore it
-- When avoiding obstacles, choose left (-Z) or right (+Z) based on clearance
-- NEVER navigate backwards (to a lower X coordinate than current position)
+- "Ahead" and "behind" depend on travel direction: in +X rows, ahead = higher X; in -X rows, ahead = lower X
+- When avoiding obstacles, choose left or right based on clearance
+- NEVER navigate backwards relative to your current travel direction
 - After avoiding an obstacle, the path is clear — continue with the deployment
-- After completing all 4 sites (or aborting the rest), call mission_complete
+- After completing all sites in a row, call turn_around() before starting the next row
+- After completing all rows (or aborting), call mission_complete
 
 OBSTACLE AVOIDANCE FLOW (when not deploying rope):
 1. go_around_obstacle(obstacle_id, direction) — navigate around it
@@ -321,6 +386,8 @@ class LLMOrchestrator(Node):
         # Progress tracking
         self.current_site_id = None  # Which site we're working on
         self.current_step = 0  # Step within the deployment sequence (1-7)
+        self.current_row = 0   # Which row we're currently deploying
+        self.travel_direction = DEPLOYMENT_ROWS[0]["direction"]  # +1 or -1
         self.step_names = [
             "",  # 0 = not started
             "get_adjusted_site_waypoints",
@@ -447,6 +514,11 @@ class LLMOrchestrator(Node):
         lines.append(f"Deployed sites: {self.deployed_sites if self.deployed_sites else 'none'}")
         if self.aborted_sites:
             lines.append(f"Aborted sites: {[s['site_id'] for s in self.aborted_sites]}")
+        dir_label = "+X" if self.travel_direction == 1 else "-X"
+        lines.append(f"Current row: {self.current_row} (traveling {dir_label})")
+        row_sites = [s for s in DEPLOYMENT_SITES if s['row'] == self.current_row]
+        row_site_ids = [s['site_id'] for s in row_sites]
+        lines.append(f"Sites in current row: {row_site_ids}")
         if self.current_site_id:
             step_desc = self.step_names[self.current_step] if self.current_step < len(self.step_names) else "unknown"
             lines.append(f"Current site: {self.current_site_id}, Step {self.current_step} of 7 (last completed: {step_desc})")
@@ -458,9 +530,12 @@ class LLMOrchestrator(Node):
     def build_system_prompt(self) -> str:
         """Build the system prompt with current state."""
         pos = self.commander.rover_position
+        dir_label = "+X" if self.travel_direction == 1 else "-X"
         return SYSTEM_PROMPT.format(
+            total_sites=len(DEPLOYMENT_SITES),
+            total_rows=len(DEPLOYMENT_ROWS),
             mission_progress=self.get_progress_info(),
-            rover_position=f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}) — traveling along +X axis",
+            rover_position=f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}) — traveling along {dir_label} axis",
             sites_info=self.get_sites_info(),
             obstacles_info=self.get_obstacles_info()
         )
@@ -528,8 +603,10 @@ class LLMOrchestrator(Node):
             obstacles_ahead = []
             obstacles_behind = []
             new_rover_x = self.commander.rover_position[0]
+            d = self.travel_direction
             for obs in self.current_obstacles:
-                if obs['x'] > new_rover_x - 2.0:
+                # "ahead" means in the travel direction
+                if d * obs['x'] > d * (new_rover_x - 2.0 * d):
                     obstacles_ahead.append(
                         f"id={obs['id']} at ({obs['x']:.1f}, {obs['y']:.1f}, {obs['z']:.1f})"
                     )
@@ -678,10 +755,12 @@ class LLMOrchestrator(Node):
         rover_x = self.commander.rover_position[0]
         rope_start_x = waypoints["rope_start"][0]
         rope_end_x = waypoints["rope_end"][0]
+        d = self.travel_direction  # +1 for +X, -1 for -X
         
-        # If rover is past rope_end, the entire site is unreachable without going backwards
-        if rover_x > rope_end_x + 1.0:
-            self.get_logger().info(f"⏭️ Rover (X={rover_x:.1f}) is past rope_end (X={rope_end_x:.1f}) — skipping site {site_id}")
+        # "Past rope_end" = rover overshot the end in the travel direction
+        # For +X: rover_x > rope_end_x.  For -X: rover_x < rope_end_x.
+        if d * rover_x > d * rope_end_x + 1.0:
+            self.get_logger().info(f"⏭️ Rover (X={rover_x:.1f}) past rope_end (X={rope_end_x:.1f}) — skipping site {site_id}")
             self.aborted_sites.append({"site_id": site_id, "reason": "rover overshot entire site"})
             return json.dumps({
                 "success": False,
@@ -691,27 +770,26 @@ class LLMOrchestrator(Node):
                 "rope_end_x": rope_end_x
             })
         
-        # If rover is past rope_start, shift all waypoints forward by the offset
-        if rover_x > rope_start_x + 1.0:
-            offset = rover_x - rope_start_x
+        # "Past rope_start" = rover overshot the start in the travel direction
+        if d * rover_x > d * rope_start_x + 1.0:
+            offset = abs(rover_x - rope_start_x)
             adjusted = {
                 "rope_start": [rover_x, waypoints["rope_start"][1], waypoints["rope_start"][2]],
-                "preamp": [waypoints["preamp"][0] + offset, waypoints["preamp"][1], waypoints["preamp"][2]],
-                "rope_end": [waypoints["rope_end"][0] + offset, waypoints["rope_end"][1], waypoints["rope_end"][2]],
+                "preamp": [waypoints["preamp"][0] + d * offset, waypoints["preamp"][1], waypoints["preamp"][2]],
+                "rope_end": [waypoints["rope_end"][0] + d * offset, waypoints["rope_end"][1], waypoints["rope_end"][2]],
             }
-            self.get_logger().info(f"📐 Adjusted waypoints for site {site_id} (offset +{offset:.1f}m): {adjusted}")
-            # Update progress
+            self.get_logger().info(f"📐 Adjusted waypoints for site {site_id} (offset {d*offset:+.1f}m): {adjusted}")
             self.current_site_id = site_id
             self.current_step = 1
             return json.dumps({
                 "success": True,
                 "adjusted": True,
-                "offset": offset,
+                "offset": d * offset,
                 "waypoints": adjusted,
                 "message": f"Waypoints shifted forward by {offset:.1f}m to avoid backwards travel"
             })
         else:
-            # Normal — rover is before rope_start
+            # Normal — rover hasn't overshot rope_start
             self.current_site_id = site_id
             self.current_step = 1
             return json.dumps({
@@ -796,10 +874,11 @@ class LLMOrchestrator(Node):
         
         obs_x, obs_y, obs_z = obstacle['x'], obstacle['y'], obstacle['z']
         rover_x = self.commander.rover_position[0]
+        d = self.travel_direction  # +1 for +X, -1 for -X
         
         # Check if obstacle is behind the rover (already passed)
-        if obs_x < rover_x - 2.0:
-            self.get_logger().info(f"⏭️ Obstacle {obstacle_id} is behind the rover (obs_x={obs_x:.1f} < rover_x={rover_x:.1f}), skipping")
+        if d * obs_x < d * rover_x - 2.0:
+            self.get_logger().info(f"⏭️ Obstacle {obstacle_id} is behind the rover (obs_x={obs_x:.1f}, rover_x={rover_x:.1f}), skipping")
             self.current_obstacles.remove(obstacle)
             return json.dumps({
                 "success": True,
@@ -819,11 +898,12 @@ class LLMOrchestrator(Node):
         avoid_x = obs_x
         avoid_y = obs_y
         
-        # Travel heading (rover moves along +X axis between sites)
-        travel_heading = 90.0  # degrees, facing +X in Unity
+        # Travel heading based on current direction
+        row_config = DEPLOYMENT_ROWS[self.current_row]
+        travel_heading = row_config["heading"]  # 90° for +X, 270° for -X
         
         self.get_logger().info(f"🚧 Navigating around obstacle: {obstacle['description']}")
-        self.get_logger().info(f"   Direction: {direction}")
+        self.get_logger().info(f"   Direction: {direction}, heading: {travel_heading}°")
         self.get_logger().info(f"   Curve 1: swerve to ({avoid_x}, {avoid_y}, {avoid_z})")
         
         # === Curve 1: current position → avoidance point (swerve) ===
@@ -834,7 +914,7 @@ class LLMOrchestrator(Node):
             self.get_logger().warn("⚠️ Timeout on curve 1 (swerve), continuing anyway")
         
         # === Curve 2: avoidance point → rejoin original line past obstacle ===
-        rejoin_x = obs_x + radius + 2.0  # Past the obstacle
+        rejoin_x = obs_x + d * (radius + 2.0)  # Past the obstacle in travel direction
         rejoin_z = obs_z  # Back on original line
         
         self.get_logger().info(f"   Curve 2: rejoin at ({rejoin_x}, {obs_y}, {rejoin_z})")
@@ -876,6 +956,104 @@ class LLMOrchestrator(Node):
             f"heading={end_heading}°, final={is_final}"
         )
     
+    def tool_turn_around(self) -> str:
+        """Execute a semicircular U-turn to the next deployment row."""
+        self.get_logger().info("🔄 LLM requested: turn_around()")
+        
+        # ── Guard: all sites in current row must be deployed or aborted ──
+        current_row_sites = [s for s in DEPLOYMENT_SITES if s['row'] == self.current_row]
+        current_row_ids = [s['site_id'] for s in current_row_sites]
+        aborted_ids = [s['site_id'] for s in self.aborted_sites]
+        handled_ids = set(self.deployed_sites) | set(aborted_ids)
+        remaining = [sid for sid in current_row_ids if sid not in handled_ids]
+        
+        if remaining:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Cannot turn around yet — sites {remaining} in Row {self.current_row} "
+                    f"are not deployed or aborted. Complete them first."
+                ),
+                "remaining_sites": remaining
+            })
+        
+        next_row_idx = self.current_row + 1
+        if next_row_idx >= len(DEPLOYMENT_ROWS):
+            return json.dumps({
+                "success": False,
+                "error": "No more rows to turn to. Call mission_complete instead."
+            })
+        
+        current_row_config = DEPLOYMENT_ROWS[self.current_row]
+        next_row_config = DEPLOYMENT_ROWS[next_row_idx]
+        d = self.travel_direction  # +1 for +X, -1 for -X
+        
+        # Find the first site in the next row
+        next_row_sites = [s for s in DEPLOYMENT_SITES if s['row'] == next_row_idx]
+        if not next_row_sites:
+            return json.dumps({"success": False, "error": f"No sites found for row {next_row_idx}"})
+        
+        target_site = next_row_sites[0]
+        target_wp = target_site['waypoints']['rope_start']
+        target_x, target_y, target_z = target_wp
+        
+        rover_pos = self.commander.rover_position
+        rover_x, rover_y, rover_z = rover_pos[0], rover_pos[1], rover_pos[2]
+        
+        # ── Semicircular U-turn with 15m diameter (= row spacing) ──
+        # Radius = ROW_SPACING_Z / 2 = 7.5m
+        radius = ROW_SPACING_Z / 2.0
+        mid_z = (rover_z + target_z) / 2.0
+        
+        # Apex of the semicircle: 7.5m ahead in current travel direction,
+        # at the midpoint Z between the two rows
+        apex_x = rover_x + d * radius
+        apex_y = rover_y
+        
+        # Headings
+        current_heading = current_row_config['heading']
+        new_heading = next_row_config['heading']
+        # At the apex (90° through the turn), rover faces perpendicular
+        # For +X→-X turn going +Z: heading = 0° (facing +Z)
+        # For -X→+X turn going -Z: heading = 180° (facing -Z)
+        apex_heading = 0.0 if (target_z > rover_z) else 180.0
+        
+        self.get_logger().info(f"🔄 Semicircular U-turn from Row {self.current_row} to Row {next_row_idx}")
+        self.get_logger().info(f"   Start:  ({rover_x:.1f}, {rover_y:.1f}, {rover_z:.1f}), heading={current_heading}°")
+        self.get_logger().info(f"   Apex:   ({apex_x:.1f}, {apex_y:.1f}, {mid_z:.1f}), heading={apex_heading}°")
+        self.get_logger().info(f"   Target: ({target_x:.1f}, {target_y:.1f}, {target_z:.1f}), heading={new_heading}°")
+        
+        # === Curve 1: start → apex (first quarter of semicircle) ===
+        self._publish_curved_goal(apex_x, apex_y, mid_z, apex_heading, is_final=False)
+        arrived1 = self.commander.wait_for_unity_arrival(timeout=45.0)
+        if not arrived1:
+            self.get_logger().warn("⚠️ Timeout on turn curve 1 (apex)")
+        
+        # === Curve 2: apex → target (second quarter of semicircle) ===
+        self._publish_curved_goal(target_x, target_y, target_z, new_heading, is_final=True)
+        arrived2 = self.commander.wait_for_unity_arrival(timeout=45.0)
+        if not arrived2:
+            self.get_logger().warn("⚠️ Timeout on turn curve 2 (complete)")
+        
+        # Update state
+        self.current_row = next_row_idx
+        self.travel_direction = next_row_config['direction']
+        self.current_site_id = None
+        self.current_step = 0
+        
+        dir_label = "+X" if self.travel_direction == 1 else "-X"
+        next_site_ids = [s['site_id'] for s in next_row_sites]
+        
+        self.get_logger().info(f"✅ Turn complete! Now on Row {self.current_row}, traveling {dir_label}")
+        return json.dumps({
+            "success": True,
+            "message": f"U-turn complete. Now on Row {next_row_idx}, traveling {dir_label}.",
+            "current_row": next_row_idx,
+            "travel_direction": dir_label,
+            "next_sites": next_site_ids,
+            "rover_position": self.commander.rover_position
+        })
+    
     def execute_tool(self, tool_name: str, arguments: dict) -> str:
         """Route tool calls to implementations."""
         if tool_name == "navigate_to_waypoint":
@@ -904,6 +1082,8 @@ class LLMOrchestrator(Node):
                 arguments["site_id"],
                 arguments.get("reason", "unspecified")
             )
+        elif tool_name == "turn_around":
+            return self.tool_turn_around()
         else:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
     
@@ -921,11 +1101,15 @@ class LLMOrchestrator(Node):
         self.get_logger().info("="*60 + "\n")
         
         # Initial user message to kick off the mission
-        user_message = "Begin the antenna deployment mission. Deploy all 4 sites in order."
+        user_message = (
+            f"Begin the antenna deployment mission. Deploy all {len(DEPLOYMENT_SITES)} sites "
+            f"across {len(DEPLOYMENT_ROWS)} rows in S-pattern order. "
+            f"Start with Row 0 (sites 1-4, +X direction), then turn_around to Row 1 (sites 5-8, -X direction)."
+        )
         self.conversation_history.append({"role": "user", "content": user_message})
         
         iteration = 0
-        max_iterations = 80  # Safety limit (8 calls/site × 4 sites + status/abort/obstacle checks)
+        max_iterations = 120  # Safety limit (8 calls/site × 8 sites + turns + status/abort/obstacle checks)
         
         while self.mission_active and iteration < max_iterations:
             iteration += 1
