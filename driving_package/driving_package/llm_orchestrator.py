@@ -164,7 +164,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "go_around_obstacle",
-            "description": "Navigate the rover around a detected obstacle using curved paths. Only use this if the obstacle is AHEAD of the rover (obstacle X > rover X). Choose left or right based on which side has more clearance.",
+            "description": "Navigate the rover around a detected obstacle using curved paths. Only use this if the obstacle is AHEAD of the rover (obstacle X > rover X). Choose left or right based on which side has more clearance. IMPORTANT: If rope is currently deploying, call abort_site FIRST to stop the rope before avoiding.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -182,26 +182,84 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_adjusted_site_waypoints",
+            "description": "Get the waypoints for a site, automatically adjusted if the rover has overshot the rope_start position. Call this BEFORE starting each site to get the correct coordinates. If the rover is past rope_start, all waypoints are shifted forward by the same offset to maintain spacing. If the rover is past rope_end, the site is marked as skipped.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "site_id": {
+                        "type": "integer",
+                        "description": "The site ID to get waypoints for (1-4)"
+                    }
+                },
+                "required": ["site_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "abort_site",
+            "description": "Abort the current site deployment. Stops rope deployment and logs the site as failed. Call this when an obstacle blocks the current deployment path or when a critical failure occurs mid-deployment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "site_id": {
+                        "type": "integer",
+                        "description": "The site ID being aborted (1-4)"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief explanation of why the site was aborted"
+                    }
+                },
+                "required": ["site_id", "reason"]
+            }
+        }
+    },
 ]
 
 SYSTEM_PROMPT = """You are an autonomous rover mission planner for lunar antenna deployment.
 
+IMPORTANT: Before EVERY tool call, you MUST provide a brief text explanation of:
+- What you are about to do and why
+- What you expect to happen
+This reasoning is logged for mission review. Never make a tool call without explaining your thinking first.
+
 MISSION OBJECTIVE:
-Deploy antennas at 4 sites in sequence.
+Deploy antennas at 4 sites in sequence along the +X axis.
 
 DEPLOYMENT SEQUENCE (for each site):
-1. navigate_to_waypoint(rope_start)  — drive to the rope start position
-2. start_rope()                      — begin deploying rope
-3. navigate_to_waypoint(preamp)      — drive to the preamp position
-4. pick_and_place()                  — place the antenna
-5. navigate_to_waypoint(rope_end)    — drive to the rope end position
-6. stop_rope(site_id)                — stop rope and finalize site
+1. get_adjusted_site_waypoints(site_id) — get waypoints (auto-adjusts if rover overshot start)
+2. navigate_to_waypoint(rope_start)     — drive to the rope start position
+3. start_rope()                         — begin deploying rope
+4. navigate_to_waypoint(preamp)         — drive to the preamp position (while laying rope)
+5. pick_and_place()                     — place the antenna
+6. navigate_to_waypoint(rope_end)       — drive to the rope end position (while laying rope)
+7. stop_rope(site_id)                   — stop rope and finalize site
 
 You MUST call each step individually. Between any two steps you may check
 mission status or handle obstacles.
 
+ROPE RULES:
+- Rope should ONLY be deploying between start_rope() and stop_rope()/abort_site()
+- NEVER call go_around_obstacle while rope is deploying
+- If an obstacle is detected mid-deployment:
+  1. Call abort_site(site_id, reason) to stop the rope
+  2. Call go_around_obstacle(obstacle_id, direction) to navigate around it
+  3. Call get_adjusted_site_waypoints for the NEXT site
+  4. Resume the deployment sequence from step 1 of the next site
+- You MUST call go_around_obstacle after aborting — do NOT skip the obstacle
+
+CURRENT MISSION STATE:
+{mission_progress}
+
 ROVER POSITION:
 {rover_position}
+ROVER SIZE: 3.0 m long, 1.5 m wide — account for this when judging obstacle clearance
 
 AVAILABLE SITES:
 {sites_info}
@@ -211,11 +269,23 @@ CURRENT OBSTACLES:
 
 RULES:
 - Deploy sites in order (1 -> 2 -> 3 -> 4) unless blocked by obstacles
-- Before navigating to a waypoint, check if any obstacle is in the way
+- navigate_to_waypoint will REFUSE to navigate if an obstacle is in the path — you MUST call go_around_obstacle first to clear it
 - The rover travels along the +X axis. Only go around obstacles that are AHEAD (obstacle X > rover X)
 - If an obstacle is behind you (obstacle X < rover X), ignore it
 - When avoiding obstacles, choose left (-Z) or right (+Z) based on clearance
-- After completing all 4 sites, call mission_complete
+- NEVER navigate backwards (to a lower X coordinate than current position)
+- After avoiding an obstacle, the path is clear — continue with the deployment
+- After completing all 4 sites (or aborting the rest), call mission_complete
+
+OBSTACLE AVOIDANCE FLOW (when not deploying rope):
+1. go_around_obstacle(obstacle_id, direction) — navigate around it
+2. Continue to your target waypoint with navigate_to_waypoint
+
+OBSTACLE AVOIDANCE FLOW (when deploying rope):
+1. abort_site(site_id, reason) — stops rope
+2. go_around_obstacle(obstacle_id, direction) — navigate around it
+3. get_adjusted_site_waypoints(next_site_id) — get shifted waypoints
+4. Continue deployment at the next site
 
 Think step by step. After each action, evaluate the result and decide the next step."""
 
@@ -240,11 +310,27 @@ class LLMOrchestrator(Node):
         
         # Mission state
         self.deployed_sites = []
+        self.aborted_sites = []  # [{site_id, reason}, ...]
         self.deployment_history = []  # [{site_id, success, reason}, ...]
         self.current_obstacles = []  # Populated by /rock_detection subscriber
         self._next_obstacle_id = 1
         self.mission_active = False
         self.conversation_history = []
+        self.rope_deploying = False  # Track rope state for LLM context
+        
+        # Progress tracking
+        self.current_site_id = None  # Which site we're working on
+        self.current_step = 0  # Step within the deployment sequence (1-7)
+        self.step_names = [
+            "",  # 0 = not started
+            "get_adjusted_site_waypoints",
+            "navigate_to_waypoint(rope_start)",
+            "start_rope",
+            "navigate_to_waypoint(preamp)",
+            "pick_and_place",
+            "navigate_to_waypoint(rope_end)",
+            "stop_rope",
+        ]
         
         # Deployment result from Unity
         self.pending_deployment_result = None
@@ -331,8 +417,14 @@ class LLMOrchestrator(Node):
     def get_sites_info(self) -> str:
         """Format site information for the system prompt."""
         lines = []
+        aborted_ids = [s["site_id"] for s in self.aborted_sites]
         for site in DEPLOYMENT_SITES:
-            status = "✅ DEPLOYED" if site["site_id"] in self.deployed_sites else "⏳ PENDING"
+            if site["site_id"] in self.deployed_sites:
+                status = "✅ DEPLOYED"
+            elif site["site_id"] in aborted_ids:
+                status = "❌ ABORTED"
+            else:
+                status = "⏳ PENDING"
             wp = site["waypoints"]
             lines.append(
                 f"- Site {site['site_id']}: {site['description']} [{status}]\n"
@@ -349,10 +441,25 @@ class LLMOrchestrator(Node):
             for o in self.current_obstacles
         ])
     
+    def get_progress_info(self) -> str:
+        """Format current mission progress for the system prompt."""
+        lines = []
+        lines.append(f"Deployed sites: {self.deployed_sites if self.deployed_sites else 'none'}")
+        if self.aborted_sites:
+            lines.append(f"Aborted sites: {[s['site_id'] for s in self.aborted_sites]}")
+        if self.current_site_id:
+            step_desc = self.step_names[self.current_step] if self.current_step < len(self.step_names) else "unknown"
+            lines.append(f"Current site: {self.current_site_id}, Step {self.current_step} of 7 (last completed: {step_desc})")
+        else:
+            lines.append("Current site: none (ready to start next site)")
+        lines.append(f"Rope deploying: {'YES' if self.rope_deploying else 'NO'}")
+        return "\n".join(lines)
+    
     def build_system_prompt(self) -> str:
         """Build the system prompt with current state."""
         pos = self.commander.rover_position
         return SYSTEM_PROMPT.format(
+            mission_progress=self.get_progress_info(),
             rover_position=f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}) — traveling along +X axis",
             sites_info=self.get_sites_info(),
             obstacles_info=self.get_obstacles_info()
@@ -365,20 +472,81 @@ class LLMOrchestrator(Node):
     def tool_navigate_to_waypoint(self, x: float, y: float, z: float) -> str:
         """Navigate the rover to a specific coordinate."""
         self.get_logger().info(f"📍 LLM requested: navigate_to_waypoint({x}, {y}, {z})")
+        
+        rover_pos = self.commander.rover_position
+        rover_x = rover_pos[0]
+        
+        # Pre-navigation obstacle check: refuse if obstacle is in the path
+        blocking = []
+        behind = []
+        for obs in self.current_obstacles:
+            obs_x = obs['x']
+            radius = obs.get('radius', 1.0)
+            # Obstacle is "in the path" if it's between rover and target along X
+            # (with radius buffer on both sides)
+            min_x = min(rover_x, x)
+            max_x = max(rover_x, x)
+            if (obs_x + radius) > min_x and (obs_x - radius) < max_x:
+                blocking.append(obs)
+            elif obs_x < rover_x - 2.0:
+                behind.append(obs)
+        
+        if blocking:
+            obs = blocking[0]  # Report the nearest blocker
+            self.get_logger().warn(
+                f"🚫 Navigation BLOCKED by obstacle id={obs['id']} "
+                f"at ({obs['x']}, {obs['y']}, {obs['z']}) — "
+                f"must call go_around_obstacle first"
+            )
+            return json.dumps({
+                "success": False,
+                "blocked": True,
+                "message": (
+                    f"BLOCKED: Obstacle id={obs['id']} at ({obs['x']:.1f}, {obs['y']:.1f}, {obs['z']:.1f}) "
+                    f"(radius {obs.get('radius', 3.0)}m) is in the path between rover "
+                    f"({rover_x:.1f}) and target ({x:.1f}). "
+                    f"You MUST call go_around_obstacle(obstacle_id={obs['id']}, direction=...) first."
+                ),
+                "blocking_obstacles": [
+                    {"id": o['id'], "x": o['x'], "y": o['y'], "z": o['z'], "radius": o.get('radius', 3.0)}
+                    for o in blocking
+                ],
+                "rover_position": list(rover_pos)
+            })
+        
         try:
             success = self.commander.go_to_site(x, y, z)
-            # Include obstacle warning if any
-            obstacle_warning = None
-            if self.current_obstacles:
-                obstacle_warning = (
-                    f"{len(self.current_obstacles)} obstacle(s) detected. "
-                    f"Check mission status for details."
-                )
+            # Track step progress based on which waypoint this likely is
+            if self.current_site_id and self.current_step in (1, 2):
+                self.current_step = 2  # Completed rope_start nav
+            elif self.current_site_id and self.current_step in (3, 4):
+                self.current_step = 4  # Completed preamp nav
+            elif self.current_site_id and self.current_step in (5, 6):
+                self.current_step = 6  # Completed rope_end nav
+            
+            # Post-arrival obstacle info (classify ahead vs behind)
+            obstacles_ahead = []
+            obstacles_behind = []
+            new_rover_x = self.commander.rover_position[0]
+            for obs in self.current_obstacles:
+                if obs['x'] > new_rover_x - 2.0:
+                    obstacles_ahead.append(
+                        f"id={obs['id']} at ({obs['x']:.1f}, {obs['y']:.1f}, {obs['z']:.1f})"
+                    )
+                else:
+                    obstacles_behind.append(obs['id'])
+            
+            warning = None
+            if obstacles_ahead:
+                warning = f"AHEAD: {'; '.join(obstacles_ahead)}. Call go_around_obstacle before navigating further."
+            elif obstacles_behind:
+                warning = f"{len(obstacles_behind)} obstacle(s) behind — no action needed."
+            
             return json.dumps({
                 "success": success,
                 "message": f"Arrived at ({x}, {y}, {z})" if success else f"Failed to reach ({x}, {y}, {z})",
                 "rover_position": self.commander.rover_position,
-                "warning": obstacle_warning
+                "warning": warning
             })
         except Exception as e:
             return json.dumps({"success": False, "error": str(e)})
@@ -387,9 +555,12 @@ class LLMOrchestrator(Node):
         """Start deploying rope."""
         self.get_logger().info("🪢 LLM requested: start_rope()")
         self.commander.set_rope(True)
+        self.rope_deploying = True
+        self.current_step = 3
         return json.dumps({
             "success": True,
-            "message": "Rope deployment started"
+            "message": "Rope deployment started",
+            "rope_deploying": True
         })
 
     def tool_pick_and_place(self) -> str:
@@ -401,6 +572,8 @@ class LLMOrchestrator(Node):
                 success = True
             else:
                 success = self.commander.deploy_antenna_at_current_site()
+            if success and self.current_site_id:
+                self.current_step = 5
             return json.dumps({
                 "success": success,
                 "message": "Antenna placed successfully" if success else "Pick and place failed"
@@ -431,6 +604,8 @@ class LLMOrchestrator(Node):
 
         # Stop rope
         self.commander.set_rope(False)
+        self.rope_deploying = False
+        self.current_step = 7
 
         # Clear any old pending result
         self.pending_deployment_result = None
@@ -470,8 +645,12 @@ class LLMOrchestrator(Node):
                 "message": f"Site {site_id} finalized. No validation received from Unity.",
                 "deployed_sites": self.deployed_sites
             })
+
+        # Reset progress for next site
+        self.current_site_id = None
+        self.current_step = 0
     
-    def wait_for_deployment_result(self, site_id: int, timeout: float = 10.0) -> dict:
+    def wait_for_deployment_result(self, site_id: int, timeout: float = 20.0) -> dict:
         """Wait for Unity to send deployment validation result."""
         self.get_logger().info(f"⏳ Waiting for Unity validation (timeout={timeout}s)...")
         
@@ -487,18 +666,103 @@ class LLMOrchestrator(Node):
         return None
 
     
+    def tool_get_adjusted_site_waypoints(self, site_id: int) -> str:
+        """Get waypoints for a site, adjusted if rover overshot rope_start."""
+        self.get_logger().info(f"📐 LLM requested: get_adjusted_site_waypoints(site_id={site_id})")
+        
+        if site_id < 1 or site_id > len(DEPLOYMENT_SITES):
+            return json.dumps({"success": False, "error": f"Invalid site_id {site_id}"})
+        
+        site = DEPLOYMENT_SITES[site_id - 1]
+        waypoints = site["waypoints"]
+        rover_x = self.commander.rover_position[0]
+        rope_start_x = waypoints["rope_start"][0]
+        rope_end_x = waypoints["rope_end"][0]
+        
+        # If rover is past rope_end, the entire site is unreachable without going backwards
+        if rover_x > rope_end_x + 1.0:
+            self.get_logger().info(f"⏭️ Rover (X={rover_x:.1f}) is past rope_end (X={rope_end_x:.1f}) — skipping site {site_id}")
+            self.aborted_sites.append({"site_id": site_id, "reason": "rover overshot entire site"})
+            return json.dumps({
+                "success": False,
+                "skipped": True,
+                "message": f"Site {site_id} skipped — rover is past rope_end. Move to next site.",
+                "rover_x": rover_x,
+                "rope_end_x": rope_end_x
+            })
+        
+        # If rover is past rope_start, shift all waypoints forward by the offset
+        if rover_x > rope_start_x + 1.0:
+            offset = rover_x - rope_start_x
+            adjusted = {
+                "rope_start": [rover_x, waypoints["rope_start"][1], waypoints["rope_start"][2]],
+                "preamp": [waypoints["preamp"][0] + offset, waypoints["preamp"][1], waypoints["preamp"][2]],
+                "rope_end": [waypoints["rope_end"][0] + offset, waypoints["rope_end"][1], waypoints["rope_end"][2]],
+            }
+            self.get_logger().info(f"📐 Adjusted waypoints for site {site_id} (offset +{offset:.1f}m): {adjusted}")
+            # Update progress
+            self.current_site_id = site_id
+            self.current_step = 1
+            return json.dumps({
+                "success": True,
+                "adjusted": True,
+                "offset": offset,
+                "waypoints": adjusted,
+                "message": f"Waypoints shifted forward by {offset:.1f}m to avoid backwards travel"
+            })
+        else:
+            # Normal — rover is before rope_start
+            self.current_site_id = site_id
+            self.current_step = 1
+            return json.dumps({
+                "success": True,
+                "adjusted": False,
+                "waypoints": waypoints,
+                "message": f"Using original waypoints for site {site_id}"
+            })
+    
+    def tool_abort_site(self, site_id: int, reason: str) -> str:
+        """Abort the current site deployment."""
+        self.get_logger().info(f"⚠️ LLM requested: abort_site(site_id={site_id}, reason='{reason}')")
+        
+        # Stop rope if deploying
+        if self.rope_deploying:
+            self.commander.set_rope(False)
+            self.rope_deploying = False
+            self.get_logger().info("🪢 Rope stopped due to site abort")
+        
+        # Log the abort
+        self.aborted_sites.append({"site_id": site_id, "reason": reason})
+        
+        # Reset progress
+        self.current_site_id = None
+        self.current_step = 0
+        
+        self.get_logger().info(f"🚫 Site {site_id} ABORTED: {reason}")
+        return json.dumps({
+            "success": True,
+            "message": f"Site {site_id} aborted: {reason}. Rope stopped. Proceed to next site.",
+            "aborted_sites": [s["site_id"] for s in self.aborted_sites],
+            "rope_deploying": False
+        })
+    
     def tool_get_mission_status(self) -> str:
         """Return current mission status."""
         self.get_logger().info("📊 LLM requested: get_mission_status()")
         
         total_sites = len(DEPLOYMENT_SITES)
-        pending = [s["site_id"] for s in DEPLOYMENT_SITES if s["site_id"] not in self.deployed_sites]
+        pending = [s["site_id"] for s in DEPLOYMENT_SITES 
+                   if s["site_id"] not in self.deployed_sites 
+                   and s["site_id"] not in [a["site_id"] for a in self.aborted_sites]]
         
         return json.dumps({
             "deployed_sites": self.deployed_sites,
+            "aborted_sites": [s["site_id"] for s in self.aborted_sites],
             "pending_sites": pending,
-            "progress": f"{len(self.deployed_sites)}/{total_sites}",
+            "progress": f"{len(self.deployed_sites)}/{total_sites} deployed, {len(self.aborted_sites)} aborted",
+            "rover_position": self.commander.rover_position,
             "obstacles": self.current_obstacles,
+            "rope_deploying": self.rope_deploying,
             "mission_complete": len(pending) == 0
         })
     
@@ -543,7 +807,7 @@ class LLMOrchestrator(Node):
                 "remaining_obstacles": len(self.current_obstacles)
             })
         
-        radius = obstacle.get('radius', 3.0)
+        radius = obstacle.get('radius', 1.0)
         offset = 5.0  # meters to swerve sideways
         
         # Swerve direction: left = -Z, right = +Z in Unity
@@ -633,6 +897,13 @@ class LLMOrchestrator(Node):
                 arguments["obstacle_id"],
                 arguments.get("direction", "left")
             )
+        elif tool_name == "get_adjusted_site_waypoints":
+            return self.tool_get_adjusted_site_waypoints(arguments["site_id"])
+        elif tool_name == "abort_site":
+            return self.tool_abort_site(
+                arguments["site_id"],
+                arguments.get("reason", "unspecified")
+            )
         else:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
     
@@ -654,7 +925,7 @@ class LLMOrchestrator(Node):
         self.conversation_history.append({"role": "user", "content": user_message})
         
         iteration = 0
-        max_iterations = 50  # Safety limit (6 calls/site × 4 sites + status checks)
+        max_iterations = 80  # Safety limit (8 calls/site × 4 sites + status/abort/obstacle checks)
         
         while self.mission_active and iteration < max_iterations:
             iteration += 1
@@ -734,7 +1005,8 @@ class LLMOrchestrator(Node):
                 })
                 
                 # If no tool call and no explicit completion, nudge the LLM
-                if len(self.deployed_sites) < len(DEPLOYMENT_SITES):
+                handled = len(self.deployed_sites) + len(self.aborted_sites)
+                if handled < len(DEPLOYMENT_SITES):
                     self.conversation_history.append({
                         "role": "user",
                         "content": "Continue with the next deployment."
@@ -752,6 +1024,7 @@ class LLMOrchestrator(Node):
             "timestamp": timestamp,
             "model": self.model,
             "deployed_sites": self.deployed_sites,
+            "aborted_sites": self.aborted_sites,
             "obstacles": self.current_obstacles,
             "system_prompt": self.build_system_prompt(),
             "conversation": self.conversation_history
@@ -789,6 +1062,13 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        # Always save conversation log, even on abort
+        if orchestrator.conversation_history:
+            orchestrator.get_logger().info("💾 Saving conversation log before shutdown...")
+            try:
+                orchestrator.save_conversation_log()
+            except Exception:
+                pass
         orchestrator.destroy_node()
         orchestrator.commander.destroy_node()
         if rclpy.ok():
