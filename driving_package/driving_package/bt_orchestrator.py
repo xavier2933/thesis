@@ -21,7 +21,7 @@ import threading
 import time
 
 from driving_package.rover_commander import RoverCommander
-from driving_package.llm_orchestrator import DEPLOYMENT_SITES
+from driving_package.llm_orchestrator import DEPLOYMENT_SITES, DEPLOYMENT_ROWS, ROW_SPACING_Z
 
 
 # ============================================================================
@@ -316,11 +316,26 @@ class MissionComplete(py_trees.behaviour.Behaviour):
 
 
 class TurnAround(py_trees.behaviour.Behaviour):
-    """Navigate the rover to a specified return point (threaded)."""
+    """Execute a semicircular U-turn to the next deployment row.
 
-    def __init__(self, target: list, commander: RoverCommander, logger):
-        super().__init__("TurnAround")
-        self.target = target
+    Mirrors LLMOrchestrator.tool_turn_around() exactly:
+      - Curve 1: current position → apex (mid-Z, 7.5 m ahead in travel dir)
+      - Curve 2: apex → first rope_start of the next row
+    Uses /rover/curved_goal (Pose) the same way the LLM version does.
+    """
+
+    def __init__(
+        self,
+        from_row_idx: int,
+        orchestrator,          # BTOrchestrator — holds current_row/travel_dir
+        curved_goal_pub,
+        commander: RoverCommander,
+        logger,
+    ):
+        super().__init__(f"TurnAround_R{from_row_idx}_to_R{from_row_idx+1}")
+        self.from_row_idx = from_row_idx
+        self.orchestrator = orchestrator
+        self.curved_goal_pub = curved_goal_pub
         self.commander = commander
         self._logger = logger
 
@@ -330,35 +345,105 @@ class TurnAround(py_trees.behaviour.Behaviour):
     def initialise(self):
         self._success = None
         self._thread = None
-        x, y, z = self.target
-        self._logger.info(
-            f"🔄 BT: Turning around — heading to ({x}, {y}, {z})"
-        )
-        self._thread = threading.Thread(
-            target=self._navigate, daemon=True
-        )
+        self._thread = threading.Thread(target=self._turn, daemon=True)
         self._thread.start()
 
     def update(self):
         if self._thread is not None and self._thread.is_alive():
             return py_trees.common.Status.RUNNING
         if self._success:
-            self._logger.info("✅ BT: Arrived at return point")
+            self._logger.info(
+                f"✅ BT: U-turn complete — now on Row {self.orchestrator.current_row}"
+            )
             return py_trees.common.Status.SUCCESS
-        self._logger.error("❌ BT: Failed to reach return point")
+        self._logger.error("❌ BT: Turn-around failed")
         return py_trees.common.Status.FAILURE
 
     def terminate(self, new_status):
         pass
 
-    def _navigate(self):
+    def _publish_curved_goal(self, x, y, z, heading, is_final):
+        msg = Pose()
+        msg.position.x = float(x)
+        msg.position.y = float(y)
+        msg.position.z = float(z)
+        msg.orientation.z = float(heading)
+        msg.orientation.w = 1.0 if is_final else 0.0
+        self.curved_goal_pub.publish(msg)
+        self._logger.info(
+            f"📤 BT: Curved goal ({x:.1f}, {y:.1f}, {z:.1f}) "
+            f"heading={heading}° final={is_final}"
+        )
+
+    def _turn(self):
         try:
-            x, y, z = self.target
-            self._success = self.commander.go_to_site(x, y, z)
-        except Exception as e:
-            self._logger.error(
-                f"💥 BT: Exception during turn-around: {e}"
+            current_row_config = DEPLOYMENT_ROWS[self.from_row_idx]
+            next_row_idx = self.from_row_idx + 1
+            next_row_config = DEPLOYMENT_ROWS[next_row_idx]
+            d = current_row_config["direction"]  # +1 or -1
+
+            # First site of the next row → target landing point
+            next_row_sites = [
+                s for s in DEPLOYMENT_SITES if s["row"] == next_row_idx
+            ]
+            target_wp = next_row_sites[0]["waypoints"]["rope_start"]
+            target_x, target_y, target_z = target_wp
+
+            rover_pos = self.commander.rover_position
+            rover_x, rover_y, rover_z = rover_pos[0], rover_pos[1], rover_pos[2]
+
+            # ── Semicircular U-turn geometry (15 m diameter = row spacing) ──
+            radius = ROW_SPACING_Z / 2.0          # 7.5 m
+            mid_z  = (rover_z + target_z) / 2.0  # halfway between rows
+
+            apex_x = rover_x + d * radius
+            apex_y = rover_y
+            # At the apex the rover faces perpendicular to its travel axis
+            apex_heading = 0.0 if target_z > rover_z else 180.0
+
+            current_heading = current_row_config["heading"]
+            new_heading      = next_row_config["heading"]
+
+            self._logger.info(
+                f"🔄 BT: U-turn Row {self.from_row_idx} → Row {next_row_idx}"
             )
+            self._logger.info(
+                f"   Start:  ({rover_x:.1f}, {rover_y:.1f}, {rover_z:.1f}) "
+                f"heading={current_heading}°"
+            )
+            self._logger.info(
+                f"   Apex:   ({apex_x:.1f}, {apex_y:.1f}, {mid_z:.1f}) "
+                f"heading={apex_heading}°"
+            )
+            self._logger.info(
+                f"   Target: ({target_x:.1f}, {target_y:.1f}, {target_z:.1f}) "
+                f"heading={new_heading}°"
+            )
+
+            # Curve 1: start → apex
+            self._publish_curved_goal(
+                apex_x, apex_y, mid_z, apex_heading, is_final=False
+            )
+            arrived1 = self.commander.wait_for_unity_arrival(timeout=45.0)
+            if not arrived1:
+                self._logger.warn("⚠️ BT: Timeout on turn curve 1 (apex)")
+
+            # Curve 2: apex → target
+            self._publish_curved_goal(
+                target_x, target_y, target_z, new_heading, is_final=True
+            )
+            arrived2 = self.commander.wait_for_unity_arrival(timeout=45.0)
+            if not arrived2:
+                self._logger.warn("⚠️ BT: Timeout on turn curve 2 (complete)")
+
+            # Update orchestrator row state
+            self.orchestrator.current_row      = next_row_idx
+            self.orchestrator.travel_direction = next_row_config["direction"]
+
+            self._success = True
+
+        except Exception as e:
+            self._logger.error(f"💥 BT: Exception during TurnAround: {e}")
             self._success = False
 
 
@@ -388,13 +473,7 @@ class BTOrchestrator(Node):
 
         # Parameters
         self.declare_parameter("debug_mode", False)
-        self.declare_parameter("return_point", [400.0, 18.0, 255.0])
         self.debug_mode = self.get_parameter("debug_mode").value
-        self.return_point = (
-            self.get_parameter("return_point")
-            .get_parameter_value()
-            .double_array_value
-        )
 
         # RoverCommander
         self.commander = RoverCommander(debug_mode=self.debug_mode)
@@ -416,6 +495,10 @@ class BTOrchestrator(Node):
         # Deployment tracking
         self.deployed_sites: list[int] = []
 
+        # Row tracking (mirrors LLMOrchestrator state)
+        self.current_row      = 0
+        self.travel_direction = DEPLOYMENT_ROWS[0]["direction"]  # +1
+
         # Build the tree
         self.tree = self._build_tree()
 
@@ -423,9 +506,6 @@ class BTOrchestrator(Node):
         self.tick_timer = self.create_timer(0.5, self._tick)
 
         self.get_logger().info("🌳 BT Orchestrator initialized")
-        self.get_logger().info(
-            f"📍 Return point: {list(self.return_point)}"
-        )
         if self.debug_mode:
             self.get_logger().info(
                 "⚡ DEBUG MODE: arm operations skipped in RoverCommander"
@@ -477,22 +557,44 @@ class BTOrchestrator(Node):
     # -- tree construction ---------------------------------------------------
 
     def _build_tree(self) -> py_trees.trees.BehaviourTree:
+        """Build the mission tree.
+
+        Structure:
+            DeployAllSites (Sequence, memory=True)
+              ├── [Row-0 site subtrees]
+              ├── TurnAround_R0_to_R1   ← semicircular U-turn
+              ├── [Row-1 site subtrees]
+              └── MissionComplete
+        """
         root = py_trees.composites.Sequence(
             name="DeployAllSites", memory=True
         )
 
+        # Group sites by row, preserving order
+        rows = {}
         for site in DEPLOYMENT_SITES:
-            root.add_child(self._make_site_subtree(site))
+            rows.setdefault(site["row"], []).append(site)
+
+        sorted_row_ids = sorted(rows.keys())
+        for i, row_id in enumerate(sorted_row_ids):
+            # Add all sites for this row
+            for site in rows[row_id]:
+                root.add_child(self._make_site_subtree(site))
+
+            # After each row (except the last), insert a U-turn
+            if i < len(sorted_row_ids) - 1:
+                root.add_child(
+                    TurnAround(
+                        from_row_idx=row_id,
+                        orchestrator=self,
+                        curved_goal_pub=self.curved_goal_pub,
+                        commander=self.commander,
+                        logger=self.get_logger(),
+                    )
+                )
 
         root.add_child(
             MissionComplete(self.deployed_sites, self.get_logger())
-        )
-        root.add_child(
-            TurnAround(
-                target=list(self.return_point),
-                commander=self.commander,
-                logger=self.get_logger(),
-            )
         )
 
         return py_trees.trees.BehaviourTree(root)
