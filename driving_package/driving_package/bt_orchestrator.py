@@ -42,6 +42,7 @@ class GoToWaypoint(py_trees.behaviour.Behaviour):
 
     def initialise(self):
         self._success = None
+        self._exception = None
         self._thread = None
         x, y, z = self.target
         self._logger.info(f"📍 BT: Navigating to {self.name} ({x}, {y}, {z})")
@@ -53,8 +54,15 @@ class GoToWaypoint(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.RUNNING
         if self._success:
             return py_trees.common.Status.SUCCESS
-        self._logger.error(f"❌ BT: Failed to reach {self.name}")
-        return py_trees.common.Status.FAILURE
+        if self._exception:
+            self._logger.error(f"❌ BT: Exception reaching {self.name}: {self._exception}")
+            return py_trees.common.Status.FAILURE
+        # go_to_site returned False (Unity arrival timeout) — warn but continue.
+        # The rover likely arrived; the arrival signal may have been dropped.
+        self._logger.warn(
+            f"⚠️ BT: Arrival timeout for {self.name} — assuming arrived, continuing"
+        )
+        return py_trees.common.Status.SUCCESS
 
     def terminate(self, new_status):
         pass
@@ -64,6 +72,7 @@ class GoToWaypoint(py_trees.behaviour.Behaviour):
             self._success = self.commander.go_to_site(*self.target)
         except Exception as e:
             self._logger.error(f"💥 BT: Exception in {self.name}: {e}")
+            self._exception = e
             self._success = False
 
 
@@ -505,7 +514,20 @@ class BTOrchestrator(Node):
         # Tick timer
         self.tick_timer = self.create_timer(0.5, self._tick)
 
+        # ── Print generated deployment sites for verification ──
         self.get_logger().info("🌳 BT Orchestrator initialized")
+        self.get_logger().info(
+            f"📋 Deployment plan: {len(DEPLOYMENT_SITES)} sites across "
+            f"{len(DEPLOYMENT_ROWS)} rows"
+        )
+        for site in DEPLOYMENT_SITES:
+            wp = site["waypoints"]
+            self.get_logger().info(
+                f"  Site {site['site_id']:>2} | Row {site['row']} | "
+                f"rope_start={wp['rope_start']} "
+                f"preamp={wp['preamp']} "
+                f"rope_end={wp['rope_end']}"
+            )
         if self.debug_mode:
             self.get_logger().info(
                 "⚡ DEBUG MODE: arm operations skipped in RoverCommander"

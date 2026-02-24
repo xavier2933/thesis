@@ -30,90 +30,62 @@ LOG_DIR = os.path.expanduser("~/thesis_ws/llm_logs")
 # MISSION CONFIGURATION
 # ============================================================================
 
-ROW_SPACING_Z = 15.0   # meters between rows in +Z
+ROW_SPACING_Z = 15.0   # meters between rows in Z
 BASE_Z = 255.0
 
 DEPLOYMENT_ROWS = [
-    {"row_id": 0, "direction": +1, "z": BASE_Z,                   "heading": 90.0},   # +X travel
-    {"row_id": 1, "direction": -1, "z": BASE_Z + ROW_SPACING_Z,   "heading": 270.0},  # -X travel
+    {"row_id": 0, "direction": +1, "z": BASE_Z,                     "heading": 90.0},   # +X travel
+    {"row_id": 1, "direction": -1, "z": BASE_Z - ROW_SPACING_Z,     "heading": 270.0},  # -X travel
+    {"row_id": 2, "direction": +1, "z": BASE_Z - 2*ROW_SPACING_Z,   "heading": 90.0},   # +X travel
+    {"row_id": 3, "direction": -1, "z": BASE_Z - 3*ROW_SPACING_Z,   "heading": 270.0},  # -X travel
 ]
 
-DEPLOYMENT_SITES = [
-    # ── Row 0: Z=255, traveling +X (rope_start.x < rope_end.x) ──
-    {
-        "site_id": 1, "row": 0,
-        "description": "Row 0, Site 1 — first antenna",
-        "waypoints": {
-            "rope_start": [405.0, 18.0, 255.0],
-            "preamp": [410.0, 18.0, 255.0],
-            "rope_end": [415.0, 18.0, 255.0],
-        }
-    },
-    {
-        "site_id": 2, "row": 0,
-        "description": "Row 0, Site 2 — second antenna",
-        "waypoints": {
-            "rope_start": [420.0, 18.0, 255.0],
-            "preamp": [425.0, 18.0, 255.0],
-            "rope_end": [430.0, 18.0, 255.0],
-        }
-    },
-    {
-        "site_id": 3, "row": 0,
-        "description": "Row 0, Site 3 — third antenna",
-        "waypoints": {
-            "rope_start": [435.0, 18.0, 255.0],
-            "preamp": [440.0, 18.0, 255.0],
-            "rope_end": [445.0, 18.0, 255.0],
-        }
-    },
-    {
-        "site_id": 4, "row": 0,
-        "description": "Row 0, Site 4 — fourth antenna",
-        "waypoints": {
-            "rope_start": [450.0, 18.0, 255.0],
-            "preamp": [455.0, 18.0, 255.0],
-            "rope_end": [460.0, 18.0, 255.0],
-        }
-    },
-    # ── Row 1: Z=270, traveling -X (rope_start.x > rope_end.x) ──
-    {
-        "site_id": 5, "row": 1,
-        "description": "Row 1, Site 5 — first antenna (reverse)",
-        "waypoints": {
-            "rope_start": [460.0, 18.0, 270.0],
-            "preamp": [455.0, 18.0, 270.0],
-            "rope_end": [450.0, 18.0, 270.0],
-        }
-    },
-    {
-        "site_id": 6, "row": 1,
-        "description": "Row 1, Site 6 — second antenna (reverse)",
-        "waypoints": {
-            "rope_start": [445.0, 18.0, 270.0],
-            "preamp": [440.0, 18.0, 270.0],
-            "rope_end": [435.0, 18.0, 270.0],
-        }
-    },
-    {
-        "site_id": 7, "row": 1,
-        "description": "Row 1, Site 7 — third antenna (reverse)",
-        "waypoints": {
-            "rope_start": [430.0, 18.0, 270.0],
-            "preamp": [425.0, 18.0, 270.0],
-            "rope_end": [420.0, 18.0, 270.0],
-        }
-    },
-    {
-        "site_id": 8, "row": 1,
-        "description": "Row 1, Site 8 — fourth antenna (reverse)",
-        "waypoints": {
-            "rope_start": [415.0, 18.0, 270.0],
-            "preamp": [410.0, 18.0, 270.0],
-            "rope_end": [405.0, 18.0, 270.0],
-        }
-    },
-]
+# ── Per-site geometry (edit these to reconfigure spacing) ──
+FIRST_RS_X    = 405.0   # rope_start X of the very first site
+BASE_Y        = 18.0    # Y coordinate (constant for all sites)
+PREAMP_DX     = 5.0     # rope_start → preamp offset (in travel direction)
+ROPE_DX       = 10.0    # rope_start → rope_end offset (in travel direction)
+SITE_SPACING  = 15.0    # rope_start-to-rope_start spacing between sites
+SITES_PER_ROW = 4       # number of antennas per row
+
+def _generate_deployment_sites():
+    """Auto-generate DEPLOYMENT_SITES from DEPLOYMENT_ROWS + geometry constants.
+
+    For +X rows the rover starts at FIRST_RS_X and works forward.
+    For -X rows the rover starts at the last rope_end of a +X row and works backward.
+    Z coordinate is taken directly from each row's config.
+    """
+    # X of the last rope_end (where a +X row finishes, and a -X row begins)
+    last_re_x = FIRST_RS_X + (SITES_PER_ROW - 1) * SITE_SPACING + ROPE_DX
+
+    sites = []
+    site_id = 1
+    for row in DEPLOYMENT_ROWS:
+        row_id = row["row_id"]
+        d      = row["direction"]   # +1 or -1
+        z      = row["z"]
+
+        # base_x: where the rover's rope_start is for the first site in this row
+        base_x = FIRST_RS_X if d == +1 else last_re_x
+
+        for i in range(SITES_PER_ROW):
+            rs_x = base_x + d * i * SITE_SPACING
+            sites.append({
+                "site_id": site_id,
+                "row": row_id,
+                "description": f"Row {row_id}, Site {i + 1}",
+                "waypoints": {
+                    "rope_start": [rs_x,              BASE_Y, z],
+                    "preamp":     [rs_x + d * PREAMP_DX, BASE_Y, z],
+                    "rope_end":   [rs_x + d * ROPE_DX,   BASE_Y, z],
+                },
+            })
+            site_id += 1
+
+    return sites
+
+DEPLOYMENT_SITES = _generate_deployment_sites()
+
 
 # ============================================================================
 # TOOL DEFINITIONS (OpenAI Function Calling Schema)
@@ -170,7 +142,7 @@ TOOLS = [
                 "properties": {
                     "site_id": {
                         "type": "integer",
-                        "description": "The site ID being completed (1-4)"
+                        "description": "The site ID being completed (1-{total})".format(total=len(DEPLOYMENT_SITES))
                     }
                 },
                 "required": ["site_id"]
@@ -238,7 +210,7 @@ TOOLS = [
                 "properties": {
                     "site_id": {
                         "type": "integer",
-                        "description": "The site ID to get waypoints for (1-4)"
+                        "description": "The site ID to get waypoints for (1-{total})".format(total=len(DEPLOYMENT_SITES))
                     }
                 },
                 "required": ["site_id"]
@@ -288,9 +260,8 @@ IMPORTANT: Before EVERY tool call, you MUST provide a brief text explanation of:
 This reasoning is logged for mission review. Never make a tool call without explaining your thinking first.
 
 MISSION OBJECTIVE:
-Deploy antennas at {total_sites} sites across {total_rows} rows in an S-pattern.
-- Row 0: travel in +X direction (sites 1–4)
-- Row 1: travel in -X direction (sites 5–8)
+Deploy antennas at {{total_sites}} sites across {{total_rows}} rows in an S-pattern.
+{{row_layout}}
 After completing all sites in a row, call turn_around() to move to the next row.
 
 DEPLOYMENT SEQUENCE (for each site):
