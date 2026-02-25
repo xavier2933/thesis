@@ -10,6 +10,7 @@ Usage:
     ros2 run driving_package bt_orchestrator --ros-args -p debug_mode:=true
 """
 
+import math
 import re
 import rclpy
 from rclpy.node import Node
@@ -22,6 +23,20 @@ import time
 
 from driving_package.rover_commander import RoverCommander
 from driving_package.llm_orchestrator import DEPLOYMENT_SITES, DEPLOYMENT_ROWS, ROW_SPACING_Z
+
+
+def compute_teleport_point(next_row_idx: int):
+    """Return (x, y, z, heading) 2 m behind the first rope_start of next_row_idx.
+
+    'Behind' means opposite to that row's travel direction, so the rover is
+    already lined up and pointing the right way when it materialises.
+    """
+    row = DEPLOYMENT_ROWS[next_row_idx]
+    d   = row["direction"]          # +1 for +X rows, -1 for -X rows
+    next_sites = [s for s in DEPLOYMENT_SITES if s["row"] == next_row_idx]
+    rs_x, rs_y, rs_z = next_sites[0]["waypoints"]["rope_start"]
+    # Step 2 m back (opposite to travel direction)
+    return rs_x - d * 2.0, rs_y, rs_z, row["heading"]
 
 
 # ============================================================================
@@ -456,6 +471,107 @@ class TurnAround(py_trees.behaviour.Behaviour):
             self._success = False
 
 
+class TeleportTurnAround(py_trees.behaviour.Behaviour):
+    """Instantly teleport the rover 2 m behind the first antenna of the next row.
+
+    Publishes a single Pose to /rover/teleport.  Unity sets the Transform
+    immediately and clears isNavigating, so wait_for_unity_arrival() returns
+    almost instantly.
+    """
+
+    def __init__(
+        self,
+        from_row_idx: int,
+        orchestrator,
+        teleport_pub,
+        commander: RoverCommander,
+        logger,
+    ):
+        super().__init__(f"Teleport_R{from_row_idx}_to_R{from_row_idx+1}")
+        self.from_row_idx  = from_row_idx
+        self.orchestrator  = orchestrator
+        self.teleport_pub  = teleport_pub
+        self.commander     = commander
+        self._logger       = logger
+        self._thread       = None
+        self._success      = None
+
+    def initialise(self):
+        self._success = None
+        self._thread  = threading.Thread(target=self._do_teleport, daemon=True)
+        self._thread.start()
+
+    def update(self):
+        if self._thread is not None and self._thread.is_alive():
+            return py_trees.common.Status.RUNNING
+        if self._success:
+            self._logger.info(
+                f"✅ BT: Teleport complete — now on Row {self.orchestrator.current_row}"
+            )
+            return py_trees.common.Status.SUCCESS
+        self._logger.error("❌ BT: Teleport failed")
+        return py_trees.common.Status.FAILURE
+
+    def terminate(self, new_status):
+        pass
+
+    def _do_teleport(self):
+        try:
+            next_row_idx = self.from_row_idx + 1
+            x, y, z, heading = compute_teleport_point(next_row_idx)
+
+            # Convert heading (code convention: 90°=+X, 270°=−X) to quaternion.
+            #   90°  → identity        {x:0, y:0, z:0, w:1}
+            #   270° → 180° yaw quat  {x:0, y:0, z:1, w:0}
+            # Code heading convention (90°=+X, 270°=−X) is 90° off from Unity.
+            # Subtract 90 so: heading=90 → unity 0° (identity), heading=270 → unity 180°.
+            unity_degrees = heading + 180
+
+            # 2. Convert to radians and DIVIDE BY 2 for Quaternions
+            half_rad = math.radians(unity_degrees) / 2.0
+
+            qz = math.sin(half_rad)
+            qw = math.cos(half_rad)
+
+            if abs(qz) < 1e-10: qz = 0.0
+            if abs(qw) < 1e-10: qw = 0.0
+
+            msg = Pose()
+            msg.position.x    = float(x)
+            msg.position.y    = float(z)   # Unity cross-track
+            # Lift the rover slightly (20.5 instead of 20.0) 
+            # to prevent ArticulationBody collision glitches on spawn
+            msg.position.z    = 20.5       
+            
+            msg.orientation.x = 0.0
+            msg.orientation.y = 0.0
+            msg.orientation.z = float(qz)
+            msg.orientation.w = float(qw)
+            
+            self.teleport_pub.publish(msg)
+
+            self._logger.info(
+                f"🚀 BT: Teleporting to Row {next_row_idx} → "
+                f"({x:.1f}, {z:.1f}, 20.0) heading={heading}° (unity={heading-90:.0f}°) "
+                f"→ quat z={qz:.4f} w={qw:.4f}"
+            )
+
+            # Wait for Unity to confirm (it sets isNavigating=false on receipt)
+            arrived = self.commander.wait_for_unity_arrival(timeout=10.0)
+            if not arrived:
+                self._logger.warn("⚠️ BT: Teleport arrival timeout — assuming success")
+
+            # Update orchestrator row state
+            next_row_config = DEPLOYMENT_ROWS[next_row_idx]
+            self.orchestrator.current_row      = next_row_idx
+            self.orchestrator.travel_direction = next_row_config["direction"]
+            self._success = True
+
+        except Exception as e:
+            self._logger.error(f"💥 BT: Exception during TeleportTurnAround: {e}")
+            self._success = False
+
+
 class _MarkDeployed(py_trees.behaviour.Behaviour):
     """Tiny bookkeeping node: appends a site_id to the deployed list."""
 
@@ -483,6 +599,8 @@ class BTOrchestrator(Node):
         # Parameters
         self.declare_parameter("debug_mode", False)
         self.debug_mode = self.get_parameter("debug_mode").value
+        self.declare_parameter("teleport_turnaround", False)
+        self.teleport_turnaround = self.get_parameter("teleport_turnaround").value
 
         # RoverCommander
         self.commander = RoverCommander(debug_mode=self.debug_mode)
@@ -492,6 +610,9 @@ class BTOrchestrator(Node):
         self.site_pub = self.create_publisher(Int32, "/deployment_site_id", 10)
         self.curved_goal_pub = self.create_publisher(
             Pose, "/rover/curved_goal", 10
+        )
+        self.teleport_pub = self.create_publisher(
+            Pose, "/rover/teleport", 10
         )
 
         # Obstacle tracking
@@ -603,17 +724,28 @@ class BTOrchestrator(Node):
             for site in rows[row_id]:
                 root.add_child(self._make_site_subtree(site))
 
-            # After each row (except the last), insert a U-turn
+            # After each row (except the last), insert a turn-around node
             if i < len(sorted_row_ids) - 1:
-                root.add_child(
-                    TurnAround(
-                        from_row_idx=row_id,
-                        orchestrator=self,
-                        curved_goal_pub=self.curved_goal_pub,
-                        commander=self.commander,
-                        logger=self.get_logger(),
+                if self.teleport_turnaround:
+                    root.add_child(
+                        TeleportTurnAround(
+                            from_row_idx=row_id,
+                            orchestrator=self,
+                            teleport_pub=self.teleport_pub,
+                            commander=self.commander,
+                            logger=self.get_logger(),
+                        )
                     )
-                )
+                else:
+                    root.add_child(
+                        TurnAround(
+                            from_row_idx=row_id,
+                            orchestrator=self,
+                            curved_goal_pub=self.curved_goal_pub,
+                            commander=self.commander,
+                            logger=self.get_logger(),
+                        )
+                    )
 
         root.add_child(
             MissionComplete(self.deployed_sites, self.get_logger())

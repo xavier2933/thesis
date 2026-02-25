@@ -16,6 +16,7 @@ from std_msgs.msg import String, Int32
 from geometry_msgs.msg import Pose
 from driving_package.rover_commander import RoverCommander
 import json
+import math
 import re
 import threading
 import time
@@ -335,6 +336,8 @@ class LLMOrchestrator(Node):
         # ROS parameters
         self.declare_parameter('debug_mode', False)
         self.debug_mode = self.get_parameter('debug_mode').value
+        self.declare_parameter('teleport_turnaround', False)
+        self.teleport_turnaround = self.get_parameter('teleport_turnaround').value
         
         # Initialize OpenAI client
         self.client = OpenAI()
@@ -390,6 +393,9 @@ class LLMOrchestrator(Node):
         
         # Curved goal publisher for obstacle avoidance
         self.curved_goal_pub = self.create_publisher(Pose, '/rover/curved_goal', 10)
+
+        # Teleport publisher (used instead of U-turn when teleport_turnaround=true)
+        self.teleport_pub = self.create_publisher(Pose, '/rover/teleport', 10)
         
         # Ensure log directory exists
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -502,14 +508,31 @@ class LLMOrchestrator(Node):
         """Build the system prompt with current state."""
         pos = self.commander.rover_position
         dir_label = "+X" if self.travel_direction == 1 else "-X"
+
+        # Build per-row description dynamically
+        row_lines = []
+        site_id = 1
+        for row in DEPLOYMENT_ROWS:
+            d_label = "+X" if row["direction"] == 1 else "-X"
+            first = site_id
+            last  = site_id + SITES_PER_ROW - 1
+            row_lines.append(
+                f"- Row {row['row_id']}: travel in {d_label} direction "
+                f"(sites {first}–{last}, Z={row['z']:.0f})"
+            )
+            site_id = last + 1
+        row_layout = "\n".join(row_lines)
+
         return SYSTEM_PROMPT.format(
             total_sites=len(DEPLOYMENT_SITES),
             total_rows=len(DEPLOYMENT_ROWS),
+            row_layout=row_layout,
             mission_progress=self.get_progress_info(),
             rover_position=f"({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}) — traveling along {dir_label} axis",
             sites_info=self.get_sites_info(),
             obstacles_info=self.get_obstacles_info()
         )
+
     
     # ========================================================================
     # TOOL IMPLEMENTATIONS
@@ -926,6 +949,56 @@ class LLMOrchestrator(Node):
             f"📤 Published curved goal: ({x}, {y}, {z}), "
             f"heading={end_heading}°, final={is_final}"
         )
+
+    def _publish_teleport(self, x, y, z, heading):
+        """Publish a teleport command to Unity via /rover/teleport.
+
+        Unity receives this, instantly sets the rover Transform, and clears
+        isNavigating so wait_for_unity_arrival() unblocks.
+
+        Heading convention (code-internal degrees):
+          90°  → +X travel → quaternion identity  {x:0, y:0, z:0, w:1}
+          270° → -X travel → 180° yaw quaternion  {x:0, y:0, z:1, w:0}
+        """
+        # Convert heading to Unity quaternion (same logic as bt_orchestrator).
+        unity_degrees = heading + 180
+
+        # Convert to radians and DIVIDE BY 2 for Quaternions
+        half_rad = math.radians(unity_degrees) / 2.0
+
+        qz = math.sin(half_rad)
+        qw = math.cos(half_rad)
+
+        if abs(qz) < 1e-10: qz = 0.0
+        if abs(qw) < 1e-10: qw = 0.0
+
+        msg = Pose()
+        msg.position.x    = float(x)
+        msg.position.y    = float(z)   # Unity cross-track
+        # Lift the rover slightly (20.5 instead of 20.0)
+        # to prevent ArticulationBody collision glitches on spawn
+        msg.position.z    = 20.5
+        msg.orientation.x = 0.0
+        msg.orientation.y = 0.0
+        msg.orientation.z = float(qz)
+        msg.orientation.w = float(qw)
+        self.teleport_pub.publish(msg)
+        self.get_logger().info(
+            f"🚀 Published teleport: ({x}, {z}, 20.5), heading={heading}° "
+            f"→ quat z={qz:.4f} w={qw:.4f}"
+        )
+
+    def _compute_teleport_point(self, next_row_idx: int):
+        """Return (x, y, z, heading) 2 m behind the first rope_start of next_row_idx.
+
+        'Behind' = opposite to that row's travel direction, so the rover is
+        already aligned and pointing the right way.
+        """
+        row = DEPLOYMENT_ROWS[next_row_idx]
+        d   = row["direction"]   # +1 or -1
+        next_sites = [s for s in DEPLOYMENT_SITES if s["row"] == next_row_idx]
+        rs_x, rs_y, rs_z = next_sites[0]["waypoints"]["rope_start"]
+        return rs_x - d * 2.0, rs_y, rs_z, row["heading"]
     
     def tool_turn_around(self) -> str:
         """Execute a semicircular U-turn to the next deployment row."""
@@ -989,36 +1062,49 @@ class LLMOrchestrator(Node):
         # For -X→+X turn going -Z: heading = 180° (facing -Z)
         apex_heading = 0.0 if (target_z > rover_z) else 180.0
         
-        self.get_logger().info(f"🔄 Semicircular U-turn from Row {self.current_row} to Row {next_row_idx}")
-        self.get_logger().info(f"   Start:  ({rover_x:.1f}, {rover_y:.1f}, {rover_z:.1f}), heading={current_heading}°")
-        self.get_logger().info(f"   Apex:   ({apex_x:.1f}, {apex_y:.1f}, {mid_z:.1f}), heading={apex_heading}°")
-        self.get_logger().info(f"   Target: ({target_x:.1f}, {target_y:.1f}, {target_z:.1f}), heading={new_heading}°")
-        
-        # === Curve 1: start → apex (first quarter of semicircle) ===
-        self._publish_curved_goal(apex_x, apex_y, mid_z, apex_heading, is_final=False)
-        arrived1 = self.commander.wait_for_unity_arrival(timeout=45.0)
-        if not arrived1:
-            self.get_logger().warn("⚠️ Timeout on turn curve 1 (apex)")
-        
-        # === Curve 2: apex → target (second quarter of semicircle) ===
-        self._publish_curved_goal(target_x, target_y, target_z, new_heading, is_final=True)
-        arrived2 = self.commander.wait_for_unity_arrival(timeout=45.0)
-        if not arrived2:
-            self.get_logger().warn("⚠️ Timeout on turn curve 2 (complete)")
-        
-        # Update state
+        if self.teleport_turnaround:
+            # ── Teleport mode: skip the physical U-turn ──────────────────────────
+            tp_x, tp_y, tp_z, tp_heading = self._compute_teleport_point(next_row_idx)
+            self.get_logger().info(
+                f"🚀 Teleporting to Row {next_row_idx}: "
+                f"({tp_x:.1f}, {tp_y:.1f}, {tp_z:.1f}) heading={tp_heading}°"
+            )
+            self._publish_teleport(tp_x, tp_y, tp_z, tp_heading)
+            arrived = self.commander.wait_for_unity_arrival(timeout=10.0)
+            if not arrived:
+                self.get_logger().warn("⚠️ Teleport arrival timeout — assuming success")
+        else:
+            # ── Semicircular U-turn (two curved goals) ────────────────────────────
+            self.get_logger().info(f"🔄 Semicircular U-turn from Row {self.current_row} to Row {next_row_idx}")
+            self.get_logger().info(f"   Start:  ({rover_x:.1f}, {rover_y:.1f}, {rover_z:.1f}), heading={current_heading}°")
+            self.get_logger().info(f"   Apex:   ({apex_x:.1f}, {apex_y:.1f}, {mid_z:.1f}), heading={apex_heading}°")
+            self.get_logger().info(f"   Target: ({target_x:.1f}, {target_y:.1f}, {target_z:.1f}), heading={new_heading}°")
+
+            # Curve 1: start → apex
+            self._publish_curved_goal(apex_x, apex_y, mid_z, apex_heading, is_final=False)
+            arrived1 = self.commander.wait_for_unity_arrival(timeout=45.0)
+            if not arrived1:
+                self.get_logger().warn("⚠️ Timeout on turn curve 1 (apex)")
+
+            # Curve 2: apex → target
+            self._publish_curved_goal(target_x, target_y, target_z, new_heading, is_final=True)
+            arrived2 = self.commander.wait_for_unity_arrival(timeout=45.0)
+            if not arrived2:
+                self.get_logger().warn("⚠️ Timeout on turn curve 2 (complete)")
+
+        # Update state (same for both paths)
         self.current_row = next_row_idx
         self.travel_direction = next_row_config['direction']
         self.current_site_id = None
         self.current_step = 0
-        
+
         dir_label = "+X" if self.travel_direction == 1 else "-X"
         next_site_ids = [s['site_id'] for s in next_row_sites]
-        
+
         self.get_logger().info(f"✅ Turn complete! Now on Row {self.current_row}, traveling {dir_label}")
         return json.dumps({
             "success": True,
-            "message": f"U-turn complete. Now on Row {next_row_idx}, traveling {dir_label}.",
+            "message": f"Row transition complete. Now on Row {next_row_idx}, traveling {dir_label}.",
             "current_row": next_row_idx,
             "travel_direction": dir_label,
             "next_sites": next_site_ids,
