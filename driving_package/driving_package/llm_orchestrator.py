@@ -251,6 +251,23 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_operator_control",
+            "description": "Pause the mission and hand control to a human operator. Use this when you encounter a situation you cannot resolve autonomously (e.g., ambiguous obstacle, repeated navigation failures, unexpected terrain, sensor anomaly). The rover will stop and wait. The operator may physically intervene and will describe what they did before returning control. Their notes will be returned as the tool result so you can factor them into your next decision.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Clear explanation of why human intervention is needed and what you are uncertain about."
+                    }
+                },
+                "required": ["reason"]
+            }
+        }
+    },
 ]
 
 SYSTEM_PROMPT = """You are an autonomous rover mission planner for lunar antenna deployment.
@@ -323,6 +340,18 @@ OBSTACLE AVOIDANCE FLOW (when deploying rope):
 2. go_around_obstacle(obstacle_id, direction) — navigate around it
 3. get_adjusted_site_waypoints(next_site_id) — get shifted waypoints
 4. Continue deployment at the next site
+
+HUMAN-IN-THE-LOOP:
+- Call request_operator_control(reason="...") whenever you are unsure about the right action.
+- Examples of when to use it (be generous — err on the side of asking):
+  * Any obstacle that is close to the rover path
+  * Repeated navigation failures or timeouts
+  * Any situation where a human perspective would reduce risk
+  * Whenever you feel uncertain about which action to take next
+- The rover will STOP and you will hand physical control to the operator. They may reposition things.
+- Their description is returned as the tool result — read it carefully and factor it into your next action.
+- After operator control returns, re-assess the situation before continuing.
+- IMPORTANT: It is better to ask too often than to make an autonomous mistake on the lunar surface.
 
 Think step by step. After each action, evaluate the result and decide the next step."""
 
@@ -912,7 +941,7 @@ class LLMOrchestrator(Node):
         rejoin_z = obs_z  # Back on original line
         
         self.get_logger().info(f"   Curve 2: rejoin at ({rejoin_x}, {obs_y}, {rejoin_z})")
-        self._publish_curved_goal(rejoin_x, obs_y, rejoin_z, travel_heading, is_final=True)
+        self._publish_curved_goal(rejoin_x, obs_y, rejoin_z, travel_heading, is_final=False)  # Not final — skip heading alignment, next navigate_to_waypoint handles it
         arrived2 = self.commander.wait_for_unity_arrival(timeout=30.0)
         
         if not arrived2:
@@ -1111,6 +1140,50 @@ class LLMOrchestrator(Node):
             "rover_position": self.commander.rover_position
         })
     
+    def tool_request_operator_control(self, reason: str) -> str:
+        """Pause the mission and hand control to a human operator via the terminal."""
+        self.get_logger().info(f"🛑 LLM requested: request_operator_control(reason='{reason}')")
+
+        # ── Release autonomous control so the operator/Unity can drive the rover ──
+        from std_msgs.msg import Bool as BoolMsg
+        self.commander.pub_aut.publish(BoolMsg(data=False))
+        self.get_logger().info("📡 Published autonomous_mode=False — rover released to manual control")
+
+        banner = "═" * 54
+        print(f"\n{banner}")
+        print("🛑  OPERATOR INTERVENTION REQUESTED")
+        print("─" * 54)
+        print(f"LLM REASON: {reason}")
+        print("─" * 54)
+        print("Rover is PAUSED. Autonomous mode DISABLED.")
+        print("You now have full manual control of the rover.")
+        print("")
+        print("When finished, press ENTER (optionally describe what you did):")
+
+        try:
+            operator_notes = input("> ").strip()
+        except EOFError:
+            operator_notes = ""
+
+        # ── Reclaim autonomous control ──
+        self.commander.pub_aut.publish(BoolMsg(data=True))
+        self.get_logger().info("📡 Published autonomous_mode=True — LLM has control again")
+
+        print(f"{banner}")
+        print("✅ Operator released control. Autonomous mode RESTORED. Resuming LLM mission...")
+        print(f"{banner}\n")
+
+        self.get_logger().info(
+            f"✅ Operator returned control. Notes: '{operator_notes}'"
+        )
+
+        return json.dumps({
+            "success": True,
+            "message": "Operator has returned control to the LLM. Autonomous mode re-enabled.",
+            "operator_notes": operator_notes if operator_notes else "(no notes provided)",
+            "instruction": "Re-assess the current situation using the operator's notes, then continue the mission."
+        })
+
     def execute_tool(self, tool_name: str, arguments: dict) -> str:
         """Route tool calls to implementations."""
         if tool_name == "navigate_to_waypoint":
@@ -1141,6 +1214,10 @@ class LLMOrchestrator(Node):
             )
         elif tool_name == "turn_around":
             return self.tool_turn_around()
+        elif tool_name == "request_operator_control":
+            return self.tool_request_operator_control(
+                arguments.get("reason", "No reason provided")
+            )
         else:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
     
