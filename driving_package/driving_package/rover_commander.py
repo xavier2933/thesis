@@ -35,6 +35,34 @@ class RoverCommander(Node):
     ORIENTATION_CORRECTION_YAW = 0.0                 # Rotation around Z
     
     # ======================================================================
+
+    # ==================== TUNABLE PLACEMENT POSE ==========================
+    # Hardcoded placement target in panda_link0 frame.
+    # Derived from /actual_end_effector_pose when arm was at the desired
+    # placement position. Unity TF for target_plate is unreliable (wrong
+    # parent frame), so we use this directly.
+    #
+    # To re-tune: move arm to desired placement position manually,
+    # then read: ros2 topic echo /actual_end_effector_pose --once
+    PLACE_X = 0.3646       # metres in panda_link0 frame
+    PLACE_Y = -0.1692      # metres in panda_link0 frame
+    PLACE_Z = -0.3087       # metres in panda_link0 frame (surface of plate)
+
+    # Hover gap above PLACE_Z before lowering
+    PLACE_HOVER_OFFSET = 0.50   # metres above plate for hover step
+    # Drop gap: how far above plate to release the block
+    PLACE_DROP_OFFSET  = 0.04   # metres above plate for release step
+    # Retract gap: lift back up after release
+    PLACE_RETRACT_OFFSET = 0.40 # metres above plate to retract to
+
+    # Placement orientation Euler angles (rad), passed to quaternion_from_euler.
+    # π roll + π/2 yaw = gripper flipped top-down and rotated 90° — this is
+    # what the original code used and is the correct orientation for placement.
+    # Adjust if the block ends up rotated wrong on the plate.
+    PLACE_ROLL  = 3.14159   # π  — flip gripper to point down
+    PLACE_PITCH = 0.0
+    PLACE_YAW   = 1.5707    # π/2 — rotate 90° around Z
+    # ======================================================================
     
     def __init__(self, debug_mode=False):
         super().__init__('rover_commander')
@@ -362,50 +390,59 @@ class RoverCommander(Node):
         self.get_logger().info(f"\n{'='*50}\n🎉 MISSION ACCOMPLISHED\n{'='*50}")
 
     def place_block_on_plate(self):
-        """Execute the sequence to place the held block onto the plate."""
+        """Execute the sequence to place the held block onto the plate.
+
+        Uses hardcoded placement coordinates (PLACE_X/Y/Z) derived from
+        /actual_end_effector_pose captured while the arm was at the correct
+        placement position.  The Unity target_plate TF is not used here
+        because its z-value is negative in panda_link0 frame (broken TF
+        chain), which makes IK impossible.
+
+        To re-tune the placement pose:
+            1. Move the arm to the desired placement position manually.
+            2. Run: ros2 topic echo /actual_end_effector_pose --once
+            3. Update PLACE_X, PLACE_Y, PLACE_Z at the top of this class.
+        """
         self.get_logger().info("🤖 Starting block placement sequence...")
-        
+
         try:
-            # Lookup plate transform (Provided by your new Unity script)
-            tf = self.tf_buffer.lookup_transform(self.base_frame, self.plate_frame, rclpy.time.Time())
-            
-            # Use a standard top-down orientation for placement
-            # You can also use the plate's rotation if needed
-            q_placement = quaternion_from_euler(3.14159, 0.0, 1.5707) # Adjust based on desired orientation
+            q_placement = quaternion_from_euler(
+                self.PLACE_ROLL, self.PLACE_PITCH, self.PLACE_YAW
+            )
 
-            # Plate position
-            tx = tf.transform.translation.x
-            ty = tf.transform.translation.y
-            tz = tf.transform.translation.z
+            tx = self.PLACE_X
+            ty = self.PLACE_Y
+            tz = self.PLACE_Z
 
-            # Log the raw TF position
-            self.get_logger().info(f"📍 TARGET_PLATE TF (raw): x={tx:.4f}, y={ty:.4f}, z={tz:.4f}")
+            self.get_logger().info(
+                f"📍 Placement target (panda_link0 frame): "
+                f"x={tx:.4f}, y={ty:.4f}, z={tz:.4f}"
+            )
 
-            xoffset = 0.02
-            tx += xoffset
-
-            # Log the adjusted position
-            self.get_logger().info(f"📍 TARGET_PLATE TF (with offset): x={tx:.4f}, y={ty:.4f}, z={tz:.4f}")
-
-            # 1. Move to hover position over plate
-            hover_z = tz + 0.20
-            self.get_logger().info(f"📍 Hovering over plate... IK target: ({tx:.4f}, {ty:.4f}, {hover_z:.4f})")
+            # 1. Hover above plate
+            hover_z = tz + self.PLACE_HOVER_OFFSET
+            self.get_logger().info(
+                f"📍 Hovering over plate... IK target: ({tx:.4f}, {ty:.4f}, {hover_z:.4f})"
+            )
             self.move_to_pose(tx, ty, hover_z, q_placement, 3.0)
 
-            # 2. Lower to plate surface
-            # Note: 0.05 is an offset to account for block height so it doesn't clip
-            lower_z = tz + 0.08
-            self.get_logger().info(f"📍 Lowering block... IK target: ({tx:.4f}, {ty:.4f}, {lower_z:.4f})")
-            self.move_to_pose(tx, ty, lower_z, q_placement, 2.0)
+            # 2. Lower to release height
+            drop_z = tz + self.PLACE_DROP_OFFSET
+            self.get_logger().info(
+                f"📍 Lowering block... IK target: ({tx:.4f}, {ty:.4f}, {drop_z:.4f})"
+            )
+            self.move_to_pose(tx, ty, drop_z, q_placement, 2.0)
 
-            # 3. Open Gripper
+            # 3. Open gripper to release block
             self.get_logger().info("👐 Releasing block...")
             self.control_gripper(True)
-            
 
-            # 4. Retract Arm
-            self.get_logger().info("📍 Retracting arm...")
-            self.move_to_pose(tx, ty, tz + 0.25, q_placement, 2.0)
+            # 4. Retract arm upward
+            retract_z = tz + self.PLACE_RETRACT_OFFSET
+            self.get_logger().info(
+                f"📍 Retracting arm... IK target: ({tx:.4f}, {ty:.4f}, {retract_z:.4f})"
+            )
+            self.move_to_pose(tx, ty, retract_z, q_placement, 2.0)
 
             self.get_logger().info("✅ Placement complete!")
 
@@ -585,7 +622,12 @@ class RoverCommander(Node):
         req.ik_request.pose_stamped = pose
         req.ik_request.ik_link_name = self.ee_link
         req.ik_request.avoid_collisions = True
-    
+
+        # Seed with current joints so IK finds the closest solution (prevents elbow flips)
+        if self.latest_joints is not None:
+            req.ik_request.robot_state.joint_state.name = self.joint_names
+            req.ik_request.robot_state.joint_state.position = self.latest_joints.tolist()
+
         # Create an event to block this thread without spinning ROS
         event = threading.Event()
         result_wrapper = {"res": None}
