@@ -44,27 +44,53 @@ def compute_teleport_point(next_row_idx: int):
 # ============================================================================
 
 class GoToWaypoint(py_trees.behaviour.Behaviour):
-    """Navigate the rover to a single waypoint (threaded)."""
+    """Navigate the rover to a single waypoint (threaded).
+
+    If *orchestrator* is supplied and the target waypoint is already behind
+    the rover (in the current travel direction), navigation is skipped and
+    SUCCESS is returned immediately — mirrors the LLM's adjusted-waypoint
+    behaviour so the rover never reverses course after an obstacle avoidance.
+    """
 
     def __init__(self, target: list, label: str,
-                 commander: RoverCommander, logger):
+                 commander: RoverCommander, logger, orchestrator=None):
         super().__init__(f"GoTo_{label}")
         self.target = target          # [x, y, z]
         self.commander = commander
         self._logger = logger
+        self.orchestrator = orchestrator
         self._thread = None
         self._success = None
+        self._skipped = False
 
     def initialise(self):
         self._success = None
         self._exception = None
         self._thread = None
+        self._skipped = False
         x, y, z = self.target
+
+        # Skip backward navigation: if the target is already behind the rover
+        # in the travel direction, don't reverse — just treat it as arrived.
+        if self.orchestrator is not None:
+            d = self.orchestrator.travel_direction   # +1 or -1
+            rover_x = self.commander.rover_position[0]
+            if d * rover_x > d * x + 1.0:           # rover is > 1 m past target
+                self._logger.info(
+                    f"⏭️ BT: {self.name} target ({x:.1f}) is behind rover "
+                    f"({rover_x:.1f}) — skipping backwards nav"
+                )
+                self._skipped = True
+                self._success = True
+                return
+
         self._logger.info(f"📍 BT: Navigating to {self.name} ({x}, {y}, {z})")
         self._thread = threading.Thread(target=self._go, daemon=True)
         self._thread.start()
 
     def update(self):
+        if self._skipped:
+            return py_trees.common.Status.SUCCESS
         if self._thread is not None and self._thread.is_alive():
             return py_trees.common.Status.RUNNING
         if self._success:
@@ -190,6 +216,38 @@ class PublishSiteId(py_trees.behaviour.Behaviour):
 
 
 # ============================================================================
+# BEHAVIOR NODES  — Site reachability
+# ============================================================================
+
+class SiteReachable(py_trees.behaviour.Behaviour):
+    """Condition: FAILURE if the rover has already passed the entire site.
+
+    Mirrors the LLM's get_adjusted_site_waypoints() skip logic: if the rover
+    is more than 1 m past rope_end (in the travel direction), the site cannot
+    be deployed without reversing — mark as unreachable so the outer Sequence
+    moves on to the next site.
+    """
+
+    def __init__(self, site: dict, orchestrator, logger):
+        super().__init__(f"SiteReachable_S{site['site_id']}")
+        self.site = site
+        self.orchestrator = orchestrator
+        self._logger = logger
+
+    def update(self):
+        d = self.orchestrator.travel_direction
+        rover_x = self.orchestrator.commander.rover_position[0]
+        rope_end_x = self.site["waypoints"]["rope_end"][0]
+        if d * rover_x > d * rope_end_x + 1.0:
+            self._logger.info(
+                f"⏭️ BT: Rover ({rover_x:.1f}) past Site {self.site['site_id']} "
+                f"rope_end ({rope_end_x:.1f}) — skipping site"
+            )
+            return py_trees.common.Status.FAILURE
+        return py_trees.common.Status.SUCCESS
+
+
+# ============================================================================
 # BEHAVIOR NODES  — Obstacle Avoidance
 # ============================================================================
 
@@ -250,9 +308,15 @@ class AvoidObstacle(py_trees.behaviour.Behaviour):
     def update(self):
         if self._thread is not None and self._thread.is_alive():
             return py_trees.common.Status.RUNNING
-        if self._success:
-            return py_trees.common.Status.SUCCESS
-        self._logger.error("❌ BT: Obstacle avoidance failed")
+        if not self._success:
+            self._logger.error("❌ BT: Obstacle avoidance maneuver failed")
+        else:
+            self._logger.info(
+                "🚧 BT: Obstacle cleared — aborting current site, advancing to next"
+            )
+        # Always return FAILURE: avoidance is a detour, not a continuation.
+        # The per-site Sequence sees FAILURE and terminates; the outer
+        # mission Sequence (memory=True) then moves on to the next site.
         return py_trees.common.Status.FAILURE
 
     def terminate(self, new_status):
@@ -269,6 +333,11 @@ class AvoidObstacle(py_trees.behaviour.Behaviour):
 
     def _avoid(self):
         try:
+            # Stop rope before maneuvering — mirrors abort_site() in the LLM
+            # orchestrator.  Safe to call even if rope is already off.
+            self.commander.set_rope(False)
+            self._logger.info("🪢 BT: Rope stopped before obstacle avoidance")
+
             rover_x = self.commander.rover_position[0]
 
             # Find nearest ahead obstacle
@@ -756,22 +825,30 @@ class BTOrchestrator(Node):
     def _make_site_subtree(self, site: dict) -> py_trees.behaviour.Behaviour:
         """Build the per-site subtree with obstacle checks before each nav.
 
+        The site sequence is wrapped in FailureIsSuccess so that an aborted
+        site (obstacle avoidance mid-deployment) doesn't kill the mission —
+        the outer Sequence simply advances to the next site.
+
         Structure per site:
-            Site_N (Sequence, memory=True)
-              ├── PublishSiteId
-              ├── ClearPath → GoToWaypoint(rope_start)
-              ├── StartRope
-              ├── ClearPath → GoToWaypoint(preamp)
-              ├── PickAndPlace
-              ├── ClearPath → GoToWaypoint(rope_end)
-              ├── StopRope
-              └── MarkDeployed
+            TrySite_N (FailureIsSuccess)
+              └── Site_N (Sequence, memory=True)
+                    ├── SiteReachable        ← skip if rover already past rope_end
+                    ├── PublishSiteId
+                    ├── ClearPath → GoToWaypoint(rope_start)  ← skips if behind rover
+                    ├── StartRope
+                    ├── ClearPath → GoToWaypoint(preamp)      ← skips if behind rover
+                    ├── PickAndPlace
+                    ├── ClearPath → GoToWaypoint(rope_end)    ← skips if behind rover
+                    ├── StopRope
+                    └── MarkDeployed
         """
         sid = site["site_id"]
         wp = site["waypoints"]
         log = self.get_logger()
 
         children = [
+            SiteReachable(site, self, log),
+
             PublishSiteId(sid, self.site_pub, log),
 
             # --- rope_start ---
@@ -795,8 +872,15 @@ class BTOrchestrator(Node):
             _MarkDeployed(sid, self.deployed_sites),
         ]
 
-        return py_trees.composites.Sequence(
+        site_seq = py_trees.composites.Sequence(
             name=f"Site{sid}", memory=True, children=children,
+        )
+
+        # Wrap in FailureIsSuccess: if this site is aborted (obstacle) or
+        # skipped (overshot), the outer mission Sequence sees SUCCESS and
+        # continues to the next site rather than terminating the mission.
+        return py_trees.decorators.FailureIsSuccess(
+            name=f"TrySite{sid}", child=site_seq
         )
 
     def _make_nav_with_obstacle_check(
@@ -835,7 +919,10 @@ class BTOrchestrator(Node):
             memory=True,
             children=[
                 clear_path,
-                GoToWaypoint(waypoint, label, self.commander, log),
+                # Pass orchestrator so GoToWaypoint can skip backward nav
+                # after an avoidance maneuver repositioned the rover.
+                GoToWaypoint(waypoint, label, self.commander, log,
+                             orchestrator=self),
             ],
         )
 
