@@ -285,7 +285,7 @@ class AvoidObstacle(py_trees.behaviour.Behaviour):
     Never seen this spelling of maneuver
     """
 
-    SWERVE_OFFSET = 5.0   # metres lateral
+    SWERVE_OFFSET = 3.0   # metres lateral
     TRAVEL_HEADING = 90.0  # degrees, +X axis
 
     def __init__(self, obstacles: list, commander: RoverCommander,
