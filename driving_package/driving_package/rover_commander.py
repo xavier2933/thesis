@@ -169,7 +169,7 @@ class RoverCommander(Node):
         """
         self.get_logger().info(f"📍 Navigating to site ({x:.1f}, {y:.1f}, {z:.1f})...")
         self.send_waypoint(x, y, z)
-        return self.wait_for_unity_arrival()
+        return self.wait_for_unity_arrival(target=(x, y, z))
     
     def deploy_antenna_at_current_site(self) -> bool:
         """
@@ -341,13 +341,14 @@ class RoverCommander(Node):
             self.get_logger().error(f"❌ Pick and place error: {e}")
             return False
 
-    def wait_for_unity_arrival(self, timeout=60.0):
+    def wait_for_unity_arrival(self, timeout=60.0, target=None):
         """Blocks until Unity reports navigation complete (isNavigating = False).
         
         Two-phase wait:
         1. Wait for Unity to acknowledge and START navigation (isNavigating = True)
         2. Wait for Unity to report arrival (isNavigating = False)
         """
+        import math
         start_time = time.time()
         
         # Phase 1: Wait for Unity to START navigating (acknowledge the waypoint)
@@ -361,13 +362,47 @@ class RoverCommander(Node):
         self.get_logger().info("🚗 Unity navigation started, waiting for arrival...")
         
         # Phase 2: Wait for Unity to FINISH navigating (arrival)
+        last_log_time = time.time()
+        last_pos = list(self.rover_position)
         while self.is_navigating:
             if time.time() - start_time > timeout:
-                self.get_logger().error("⏰ Timeout waiting for arrival!")
+                pos = self.rover_position
+                self.get_logger().error(
+                    f"⏰ Timeout waiting for arrival! "
+                    f"Final rover pos: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
+                )
                 return False
+            # Periodic position log every 5 seconds
+            now = time.time()
+            if now - last_log_time >= 5.0:
+                pos = self.rover_position
+                moved = math.sqrt(sum((pos[i]-last_pos[i])**2 for i in range(3)))
+                if target:
+                    dist = math.sqrt((pos[0]-target[0])**2 + (pos[2]-target[2])**2)
+                    self.get_logger().info(
+                        f"🔄 Nav update @ {now-start_time:.0f}s: "
+                        f"pos=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})  "
+                        f"dist_to_target={dist:.2f}m  "
+                        f"moved_last_5s={moved:.2f}m"
+                        + ("  ⚠️ STUCK/SPINNING" if moved < 0.1 else "")
+                    )
+                else:
+                    self.get_logger().info(
+                        f"🔄 Nav update @ {now-start_time:.0f}s: "
+                        f"pos=({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})  "
+                        f"moved_last_5s={moved:.2f}m"
+                        + ("  ⚠️ STUCK/SPINNING" if moved < 0.1 else "")
+                    )
+                last_log_time = now
+                last_pos = list(pos)
             time.sleep(0.1)
         
-        self.get_logger().info("📍 Unity reported arrival.")
+        pos = self.rover_position
+        elapsed = time.time() - start_time
+        self.get_logger().info(
+            f"📍 Unity reported arrival in {elapsed:.1f}s. "
+            f"Final pos: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
+        )
         return True
         
         

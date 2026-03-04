@@ -819,6 +819,7 @@ class BTOrchestrator(Node):
         root.add_child(
             MissionComplete(self.deployed_sites, self.get_logger())
         )
+        # py_trees.display.render_dot_tree(root, name="bt_mission")
 
         return py_trees.trees.BehaviourTree(root)
 

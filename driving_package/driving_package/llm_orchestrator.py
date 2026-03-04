@@ -941,7 +941,7 @@ class LLMOrchestrator(Node):
         rejoin_z = obs_z  # Back on original line
         
         self.get_logger().info(f"   Curve 2: rejoin at ({rejoin_x}, {obs_y}, {rejoin_z})")
-        self._publish_curved_goal(rejoin_x, obs_y, rejoin_z, travel_heading, is_final=False)  # Not final — skip heading alignment, next navigate_to_waypoint handles it
+        self._publish_curved_goal(rejoin_x, obs_y, rejoin_z, travel_heading, is_final=True)  # Final  snap to travel heading on arrival (mirrors BT AvoidObstacle) — skip heading alignment, next navigate_to_waypoint handles it
         arrived2 = self.commander.wait_for_unity_arrival(timeout=30.0)
         
         if not arrived2:
