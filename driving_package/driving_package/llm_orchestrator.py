@@ -793,23 +793,32 @@ class LLMOrchestrator(Node):
                 "rope_end_x": rope_end_x
             })
         
-        # "Past rope_start" = rover overshot the start in the travel direction
-        if d * rover_x > d * rope_start_x + 1.0:
-            offset = abs(rover_x - rope_start_x)
+        # "Past rope_start" = rover overshot the start in the travel direction.
+        # Threshold is 0.0: any forward overshoot triggers adjustment so the LLM
+        # never navigates backwards.
+        if d * rover_x > d * rope_start_x + 0.0:
+            # Mirror the BT GoToWaypoint skip pattern: skip behind-rover waypoints so
+            # the next navigate call always goes FORWARD (+X).
+            # Key fix: use rover's actual Z (not the original row Z=255.0) and place
+            # rope_start 0.5 m ahead of rover so SetLineGoal derives heading ~90° (+X),
+            # not ~0° (+Z) which happened when rover_x == target_x but Z differed.
+            rover_z = self.commander.rover_position[2]
+            new_rs_x = rover_x + d * 0.5   # half-metre ahead guarantees forward heading
             adjusted = {
-                "rope_start": [rover_x, waypoints["rope_start"][1], waypoints["rope_start"][2]],
-                "preamp": [waypoints["preamp"][0] + d * offset, waypoints["preamp"][1], waypoints["preamp"][2]],
-                "rope_end": [waypoints["rope_end"][0] + d * offset, waypoints["rope_end"][1], waypoints["rope_end"][2]],
+                "rope_start": [new_rs_x,                 waypoints["rope_start"][1], rover_z],
+                "preamp":     [new_rs_x + d * PREAMP_DX, waypoints["preamp"][1],     rover_z],
+                "rope_end":   [new_rs_x + d * ROPE_DX,   waypoints["rope_end"][1],   rover_z],
             }
-            self.get_logger().info(f"📐 Adjusted waypoints for site {site_id} (offset {d*offset:+.1f}m): {adjusted}")
+            offset = d * (new_rs_x - rope_start_x)
+            self.get_logger().info(f"📐 Adjusted waypoints for site {site_id} (offset {offset:+.1f}m, rover_z={rover_z:.2f}): {adjusted}")
             self.current_site_id = site_id
             self.current_step = 1
             return json.dumps({
                 "success": True,
                 "adjusted": True,
-                "offset": d * offset,
+                "offset": offset,
                 "waypoints": adjusted,
-                "message": f"Waypoints shifted forward by {offset:.1f}m to avoid backwards travel"
+                "message": f"Waypoints anchored 0.5 m ahead of rover. navigate_to_waypoint(rope_start) will be in +X direction."
             })
         else:
             # Normal — rover hasn't overshot rope_start
@@ -938,7 +947,7 @@ class LLMOrchestrator(Node):
         
         # === Curve 2: avoidance point → rejoin original line past obstacle ===
         rejoin_x = obs_x + d * (radius + 2.0)  # Past the obstacle in travel direction
-        rejoin_z = obs_z  # Back on original line
+        rejoin_z = row_config["z"]  # Snap back to the row's centerline Z, not the obstacle's Z
         
         self.get_logger().info(f"   Curve 2: rejoin at ({rejoin_x}, {obs_y}, {rejoin_z})")
         self._publish_curved_goal(rejoin_x, obs_y, rejoin_z, travel_heading, is_final=True)  # Final  snap to travel heading on arrival (mirrors BT AvoidObstacle) — skip heading alignment, next navigate_to_waypoint handles it
