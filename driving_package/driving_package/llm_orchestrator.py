@@ -572,8 +572,23 @@ class LLMOrchestrator(Node):
         self.get_logger().info(f"📍 LLM requested: navigate_to_waypoint({x}, {y}, {z})")
         
         rover_pos = self.commander.rover_position
-        rover_x = rover_pos[0]
-        
+        rover_x   = rover_pos[0]
+
+        # Proximity pre-check: if already within stopDistance of target, skip.
+        # Without this, SetLineGoal derives heading from a tiny backwards vector on
+        # retries (e.g. dz=-0.13m) and sends the rover driving the wrong direction.
+        dist_xz = math.sqrt((rover_pos[0] - x) ** 2 + (rover_pos[2] - z) ** 2)
+        if dist_xz < 0.5:
+            self.get_logger().info(
+                f"✅ Already within {dist_xz:.2f}m of ({x}, {y}, {z}) — skipping navigation"
+            )
+            return json.dumps({
+                "success": True,
+                "message": f"Already at ({x}, {y}, {z}) (dist={dist_xz:.2f}m < 0.5m). No navigation needed.",
+                "rover_position": list(rover_pos),
+                "warning": None
+            })
+
         # Pre-navigation obstacle check: refuse if obstacle is in the path
         blocking = []
         behind = []
