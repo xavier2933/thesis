@@ -11,6 +11,7 @@ Usage:
 """
 
 import math
+import os
 import re
 import rclpy
 from rclpy.node import Node
@@ -701,8 +702,23 @@ class BTOrchestrator(Node):
         # Build the tree
         self.tree = self._build_tree()
 
+        # Count total nodes in the tree
+        total_nodes = len(list(self.tree.root.iterate()))
+        self.get_logger().info(f"🌳 BT has {total_nodes} nodes total")
+
+        # Render a PNG of the first site's subtree for inspection
+        sample_subtree = self._make_site_subtree(DEPLOYMENT_SITES[0])
+        out_dir = os.getcwd()
+        py_trees.display.render_dot_tree(
+            sample_subtree, name="site1_subtree", target_directory=out_dir
+        )
+        self.get_logger().info(f"🖼️  Site subtree PNG saved to {out_dir}/site1_subtree.png")
+
         # Tick timer
         self.tick_timer = self.create_timer(0.5, self._tick)
+
+        # Mission timing
+        self._mission_start_time = None
 
         # ── Print generated deployment sites for verification ──
         self.get_logger().info("🌳 BT Orchestrator initialized")
@@ -930,6 +946,11 @@ class BTOrchestrator(Node):
     # -- tick callback -------------------------------------------------------
 
     def _tick(self):
+        # Record start time on the very first tick
+        if self._mission_start_time is None:
+            self._mission_start_time = time.time()
+            self.get_logger().info("[TIMER] Mission timer started")
+
         self.tree.tick()
 
         status = self.tree.root.status
@@ -942,7 +963,13 @@ class BTOrchestrator(Node):
             py_trees.common.Status.SUCCESS,
             py_trees.common.Status.FAILURE,
         ):
-            self.get_logger().info("🌳 BT finished — stopping ticks")
+            elapsed = time.time() - self._mission_start_time
+            minutes, seconds = divmod(elapsed, 60)
+            self.get_logger().info(
+                f"[TIMER] Mission duration: {int(minutes)}m {seconds:.1f}s "
+                f"({elapsed:.1f}s total)"
+            )
+            self.get_logger().info("BT finished — stopping ticks")
             self.tick_timer.cancel()
 
 
