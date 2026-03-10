@@ -1219,7 +1219,12 @@ class LLMOrchestrator(Node):
         elif tool_name == "pick_and_place":
             return self.tool_pick_and_place()
         elif tool_name == "stop_rope":
-            return self.tool_stop_rope(arguments["site_id"])
+            site_id = arguments.get("site_id") or self.current_site_id
+            if site_id is None:
+                return json.dumps({"success": False, "error": "stop_rope called without site_id and no current site tracked"})
+            if "site_id" not in arguments:
+                self.get_logger().warn(f"[LLM] stop_rope called without site_id — inferred site_id={site_id} from current_site_id")
+            return self.tool_stop_rope(site_id)
         elif tool_name == "get_mission_status":
             return self.tool_get_mission_status()
         elif tool_name == "mission_complete":
@@ -1232,8 +1237,13 @@ class LLMOrchestrator(Node):
         elif tool_name == "get_adjusted_site_waypoints":
             return self.tool_get_adjusted_site_waypoints(arguments["site_id"])
         elif tool_name == "abort_site":
+            site_id = arguments.get("site_id") or self.current_site_id
+            if site_id is None:
+                return json.dumps({"success": False, "error": "abort_site called without site_id and no current site tracked"})
+            if "site_id" not in arguments:
+                self.get_logger().warn(f"[LLM] abort_site called without site_id — inferred site_id={site_id} from current_site_id")
             return self.tool_abort_site(
-                arguments["site_id"],
+                site_id,
                 arguments.get("reason", "unspecified")
             )
         elif tool_name == "turn_around":
@@ -1253,47 +1263,113 @@ class LLMOrchestrator(Node):
         """Main ReAct loop: prompt LLM -> execute tool -> repeat."""
         self.mission_active = True
         self.conversation_history = []
+
+        # ── Timing & token tracking ──────────────────────────────────────────
+        mission_start_time = time.time()
+        total_prompt_tokens     = 0
+        total_completion_tokens = 0
+        total_tokens            = 0
+        # ────────────────────────────────────────────────────────────────────
         
         self.get_logger().info("\n" + "="*60)
-        self.get_logger().info("🚀 STARTING LLM-GUIDED MISSION")
+        self.get_logger().info("STARTING LLM-GUIDED MISSION")
+        self.get_logger().info("[TIMER] Mission timer started")
         self.get_logger().info("="*60 + "\n")
         
         # Initial user message to kick off the mission
         user_message = (
             f"Begin the antenna deployment mission. Deploy all {len(DEPLOYMENT_SITES)} sites "
-            f"across {len(DEPLOYMENT_ROWS)} rows in S-pattern order. "
-            f"Start with Row 0 (sites 1-4, +X direction), then turn_around to Row 1 (sites 5-8, -X direction)."
+            f"across {len(DEPLOYMENT_ROWS)} rows in S-pattern order as described in your instructions. "
+            f"Work through every row listed in the row layout, calling turn_around() after completing "
+            f"each row before starting the next. Call mission_complete only after all "
+            f"{len(DEPLOYMENT_ROWS)} rows are finished."
         )
         self.conversation_history.append({"role": "user", "content": user_message})
         
         iteration = 0
         max_iterations = 120  # Safety limit (8 calls/site × 8 sites + turns + status/abort/obstacle checks)
+
+        def _log_mission_summary(reason: str):
+            """Log elapsed time and cumulative token usage."""
+            elapsed = time.time() - mission_start_time
+            minutes, seconds = divmod(elapsed, 60)
+            self.get_logger().info("\n" + "="*60)
+            self.get_logger().info(f"[TIMER] Mission ended: {reason}")
+            self.get_logger().info(
+                f"[TIMER] Duration : {int(minutes)}m {seconds:.1f}s ({elapsed:.1f}s total)"
+            )
+            self.get_logger().info(
+                f"[TOKENS] Prompt={total_prompt_tokens}  "
+                f"Completion={total_completion_tokens}  "
+                f"Total={total_tokens}  "
+                f"Iterations={iteration}"
+            )
+            self.get_logger().info("="*60 + "\n")
+            # Stash for save_conversation_log
+            self._mission_stats = {
+                "duration_s": round(elapsed, 2),
+                "iterations": iteration,
+                "tokens": {
+                    "prompt":     total_prompt_tokens,
+                    "completion": total_completion_tokens,
+                    "total":      total_tokens,
+                },
+            }
         
         while self.mission_active and iteration < max_iterations:
             iteration += 1
             self.get_logger().info(f"\n--- ReAct Iteration {iteration} ---")
             
-            # Call LLM with current conversation + tools
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.build_system_prompt()},
-                    *self.conversation_history
-                ],
-                tools=TOOLS,
-                tool_choice="auto"
-            )
+            # Call LLM with current conversation + tools (retry on rate limit)
+            for _attempt in range(5):
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": self.build_system_prompt()},
+                            *self.conversation_history
+                        ],
+                        tools=TOOLS,
+                        tool_choice="auto"
+                    )
+                    break  # success
+                except Exception as api_err:
+                    from openai import RateLimitError
+                    if isinstance(api_err, RateLimitError) and _attempt < 4:
+                        wait = 2 ** (_attempt + 1)  # 2, 4, 8, 16, 32 s
+                        self.get_logger().warn(
+                            f"[RATE LIMIT] 429 on iteration {iteration} "
+                            f"(attempt {_attempt+1}/5) — retrying in {wait}s"
+                        )
+                        time.sleep(wait)
+                    else:
+                        raise
+
+            # ── Token accounting ─────────────────────────────────────────────
+            if response.usage:
+                u = response.usage
+                total_prompt_tokens     += u.prompt_tokens
+                total_completion_tokens += u.completion_tokens
+                total_tokens            += u.total_tokens
+                self.get_logger().info(
+                    f"[TOKENS] iter={iteration}  "
+                    f"prompt={u.prompt_tokens}  "
+                    f"completion={u.completion_tokens}  "
+                    f"total={u.total_tokens}  "
+                    f"(cumulative: {total_tokens})"
+                )
+            # ────────────────────────────────────────────────────────────────
             
             assistant_message = response.choices[0].message
             
             # Log the LLM's thinking (if any)
             if assistant_message.content:
                 self.get_logger().info(f"\n{'─'*40}")
-                self.get_logger().info(f"🧠 LLM REASONING:")
+                self.get_logger().info(f"LLM REASONING:")
                 self.get_logger().info(f"{assistant_message.content}")
                 self.get_logger().info(f"{'─'*40}")
             else:
-                self.get_logger().info(f"🧠 LLM: (no reasoning provided, direct tool call)")
+                self.get_logger().info(f"LLM: (no reasoning provided, direct tool call)")
             
             # Check if LLM wants to call tools
             if assistant_message.tool_calls:
@@ -1319,11 +1395,11 @@ class LLMOrchestrator(Node):
                     tool_name = tool_call.function.name
                     arguments = json.loads(tool_call.function.arguments)
                     
-                    self.get_logger().info(f"🔧 Executing: {tool_name}({arguments})")
+                    self.get_logger().info(f"Executing: {tool_name}({arguments})")
                     
                     result = self.execute_tool(tool_name, arguments)
                     
-                    self.get_logger().info(f"📤 Result: {result}")
+                    self.get_logger().info(f"Result: {result}")
                     
                     # Add tool result to conversation
                     self.conversation_history.append({
@@ -1334,9 +1410,7 @@ class LLMOrchestrator(Node):
                     
                     # Check if mission_complete was called
                     if tool_name == "mission_complete":
-                        self.get_logger().info("\n" + "="*60)
-                        self.get_logger().info("🎉 MISSION COMPLETE")
-                        self.get_logger().info("="*60 + "\n")
+                        _log_mission_summary("mission_complete called")
                         self.save_conversation_log()
                         return
             else:
@@ -1354,7 +1428,8 @@ class LLMOrchestrator(Node):
                         "content": "Continue with the next deployment."
                     })
         
-        self.get_logger().warn(f"⚠️ ReAct loop ended after {iteration} iterations")
+        _log_mission_summary(f"max iterations ({max_iterations}) reached")
+        self.get_logger().warn(f"ReAct loop ended after {iteration} iterations")
         self.save_conversation_log()
     
     def save_conversation_log(self):
@@ -1368,6 +1443,7 @@ class LLMOrchestrator(Node):
             "deployed_sites": self.deployed_sites,
             "aborted_sites": self.aborted_sites,
             "obstacles": self.current_obstacles,
+            "mission_stats": getattr(self, "_mission_stats", None),
             "system_prompt": self.build_system_prompt(),
             "conversation": self.conversation_history
         }
@@ -1375,7 +1451,7 @@ class LLMOrchestrator(Node):
         with open(log_file, "w") as f:
             json.dump(log_data, f, indent=2)
         
-        self.get_logger().info(f"\n📝 Conversation saved to: {log_file}")
+        self.get_logger().info(f"\nConversation saved to: {log_file}")
         self.get_logger().info(f"   View with: cat {log_file} | python -m json.tool")
 
 
