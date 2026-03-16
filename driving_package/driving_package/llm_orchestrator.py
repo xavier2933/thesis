@@ -903,7 +903,7 @@ class LLMOrchestrator(Node):
         })
     
     def tool_go_around_obstacle(self, obstacle_id: int, direction: str = "left") -> str:
-        """Navigate around an obstacle using two Bezier curve goals."""
+        """Teleport past an obstacle to the start of the next site in the current row."""
         self.get_logger().info(f"🪨 LLM requested: go_around_obstacle(obstacle_id={obstacle_id}, direction={direction})")
         
         # Find the obstacle
@@ -933,53 +933,51 @@ class LLMOrchestrator(Node):
                 "remaining_obstacles": len(self.current_obstacles)
             })
         
-        radius = obstacle.get('radius', 1.0)
-        offset = 5.0  # meters to swerve sideways
+        # Find next site in the same row
+        current_sites = [s for s in DEPLOYMENT_SITES if s["row"] == self.current_row]
         
-        # Swerve direction: left = -Z, right = +Z in Unity
-        if direction == "right":
-            avoid_z = obs_z + offset
+        # The LLM doesn't pass site_id here (it aborts first), so we use the stored current_site_id or find the first 
+        # non-deployed/non-aborted site ahead of the rover.
+        aborted_ids = [s['site_id'] for s in self.aborted_sites]
+        handled_ids = set(self.deployed_sites) | set(aborted_ids)
+        
+        next_site = None
+        for s in current_sites:
+            # Look for the first site not handled yet
+            if s["site_id"] not in handled_ids:
+                next_site = s
+                break
+                
+        travel_heading = DEPLOYMENT_ROWS[self.current_row]["heading"]
+
+        if next_site:
+            target_x, target_y, target_z = next_site["waypoints"]["rope_start"]
+            # 1 meter in front of the start of the next deployment site
+            teleport_x = target_x - d * 1.0
+            teleport_y = target_y
+            teleport_z = target_z
         else:
-            avoid_z = obs_z - offset
+            # If no next site in this row, teleport past the obstacle as fallback
+            radius = obstacle.get('radius', 3.0)
+            teleport_x = obs_x + d * (radius + 2.0)
+            teleport_y = obs_y
+            teleport_z = obs_z
         
-        avoid_x = obs_x
-        avoid_y = obs_y
+        self.get_logger().info(f"🚧 Teleporting past obstacle: {obstacle['description']}")
+        self.get_logger().info(f"   Teleport point: ({teleport_x:.1f}, {teleport_y:.1f}, {teleport_z:.1f})")
         
-        # Travel heading based on current direction
-        row_config = DEPLOYMENT_ROWS[self.current_row]
-        travel_heading = row_config["heading"]  # 90° for +X, 270° for -X
+        self._publish_teleport(teleport_x, teleport_y, teleport_z, travel_heading)
+        arrived = self.commander.wait_for_unity_arrival(timeout=10.0)
         
-        self.get_logger().info(f"🚧 Navigating around obstacle: {obstacle['description']}")
-        self.get_logger().info(f"   Direction: {direction}, heading: {travel_heading}°")
-        self.get_logger().info(f"   Curve 1: swerve to ({avoid_x}, {avoid_y}, {avoid_z})")
-        
-        # === Curve 1: current position → avoidance point (swerve) ===
-        self._publish_curved_goal(avoid_x, avoid_y, avoid_z, travel_heading, is_final=False)
-        arrived1 = self.commander.wait_for_unity_arrival(timeout=30.0)
-        
-        if not arrived1:
-            self.get_logger().warn("⚠️ Timeout on curve 1 (swerve), continuing anyway")
-        
-        # === Curve 2: avoidance point → rejoin original line past obstacle ===
-        rejoin_x = obs_x + d * (radius + 2.0)  # Past the obstacle in travel direction
-        rejoin_z = row_config["z"]  # Snap back to the row's centerline Z, not the obstacle's Z
-        
-        self.get_logger().info(f"   Curve 2: rejoin at ({rejoin_x}, {obs_y}, {rejoin_z})")
-        self._publish_curved_goal(rejoin_x, obs_y, rejoin_z, travel_heading, is_final=True)  # Final  snap to travel heading on arrival (mirrors BT AvoidObstacle) — skip heading alignment, next navigate_to_waypoint handles it
-        arrived2 = self.commander.wait_for_unity_arrival(timeout=30.0)
-        
-        if not arrived2:
-            self.get_logger().warn("⚠️ Timeout on curve 2 (rejoin), continuing anyway")
+        if not arrived:
+            self.get_logger().warn("⚠️ Teleport arrival timeout — assuming success")
         
         # Mark obstacle as cleared
         self.current_obstacles.remove(obstacle)
         
         return json.dumps({
             "success": True,
-            "message": f"Successfully navigated around the obstacle at ({obs_x}, {obs_y}, {obs_z}) going {direction}. Path is now clear.",
-            "direction": direction,
-            "avoidance_point": [avoid_x, avoid_y, avoid_z],
-            "rejoin_point": [rejoin_x, obs_y, rejoin_z],
+            "message": f"Successfully teleported past the obstacle at ({obs_x}, {obs_y}, {obs_z}) to the next deployment position.",
             "remaining_obstacles": len(self.current_obstacles)
         })
     
