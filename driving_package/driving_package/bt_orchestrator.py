@@ -278,24 +278,22 @@ class ObstacleAhead(py_trees.behaviour.Behaviour):
 
 
 class AvoidObstacle(py_trees.behaviour.Behaviour):
-    """Navigate around the nearest ahead obstacle using two curved goals.
+    """Teleport past the nearest ahead obstacle.
 
-    Replicates the logic of LLMOrchestrator.tool_go_around_obstacle().
     Threaded — returns RUNNING while the manoeuvre is in progress.
-
-    Never seen this spelling of maneuver
     """
 
-    SWERVE_OFFSET = 3.0   # metres lateral
     TRAVEL_HEADING = 90.0  # degrees, +X axis
 
     def __init__(self, obstacles: list, commander: RoverCommander,
-                 curved_goal_pub, logger):
+                 teleport_pub, logger, orchestrator, site_id: int):
         super().__init__("AvoidObstacle")
         self.obstacles = obstacles
         self.commander = commander
-        self.curved_goal_pub = curved_goal_pub
+        self.teleport_pub = teleport_pub
         self._logger = logger
+        self.orchestrator = orchestrator
+        self.site_id = site_id
 
         self._thread = None
         self._success = None
@@ -323,15 +321,6 @@ class AvoidObstacle(py_trees.behaviour.Behaviour):
     def terminate(self, new_status):
         pass
 
-    def _publish_curved_goal(self, x, y, z, heading, is_final):
-        msg = Pose()
-        msg.position.x = float(x)
-        msg.position.y = float(y)
-        msg.position.z = float(z)
-        msg.orientation.z = float(heading)
-        msg.orientation.w = 1.0 if is_final else 0.0
-        self.curved_goal_pub.publish(msg)
-
     def _avoid(self):
         try:
             # Stop rope before maneuvering — mirrors abort_site() in the LLM
@@ -351,28 +340,64 @@ class AvoidObstacle(py_trees.behaviour.Behaviour):
             obs_x = obstacle["x"]
             obs_y = obstacle["y"]
             obs_z = obstacle["z"]
-            radius = obstacle.get("radius", 3.0)
 
-            # Always swerve left (-Z) — matches LLM default
-            avoid_z = obs_z - self.SWERVE_OFFSET
+            # Find next site in the same row
+            current_row = self.orchestrator.current_row
+            current_sites = [s for s in DEPLOYMENT_SITES if s["row"] == current_row]
+            
+            next_site = None
+            for s in current_sites:
+                if s["site_id"] > self.site_id:
+                    next_site = s
+                    break
+            
+            if next_site:
+                target_x, target_y, target_z = next_site["waypoints"]["rope_start"]
+                d = self.orchestrator.travel_direction
+                # 1 meter in front of the start of the next deployment site
+                teleport_x = target_x - d * 1.0
+                teleport_y = target_y
+                teleport_z = target_z
+                
+                heading = DEPLOYMENT_ROWS[current_row]["heading"]
+            else:
+                # If no next site in this row, teleport past the obstacle as fallback
+                radius = obstacle.get("radius", 3.0)
+                teleport_x = obs_x + radius + 2.0
+                teleport_y = obs_y
+                teleport_z = obs_z
+                heading = self.TRAVEL_HEADING
 
             self._logger.info(
                 f"🚧 BT: Avoiding obstacle id={obstacle['id']} "
-                f"at ({obs_x}, {obs_y}, {obs_z}) — swerving left"
+                f"at ({obs_x}, {obs_y}, {obs_z}) — teleporting to next site"
             )
 
-            # Curve 1: swerve to avoidance point
-            self._publish_curved_goal(
-                obs_x, obs_y, avoid_z, self.TRAVEL_HEADING, is_final=False
-            )
-            self.commander.wait_for_unity_arrival(timeout=30.0)
+            unity_degrees = heading + 180
+            half_rad = math.radians(unity_degrees) / 2.0
 
-            # Curve 2: rejoin original line past obstacle
-            rejoin_x = obs_x + radius + 2.0
-            self._publish_curved_goal(
-                rejoin_x, obs_y, obs_z, self.TRAVEL_HEADING, is_final=True
-            )
-            self.commander.wait_for_unity_arrival(timeout=30.0)
+            qz = math.sin(half_rad)
+            qw = math.cos(half_rad)
+
+            if abs(qz) < 1e-10: qz = 0.0
+            if abs(qw) < 1e-10: qw = 0.0
+
+            msg = Pose()
+            msg.position.x    = float(teleport_x)
+            msg.position.y    = float(teleport_z)   # Unity cross-track
+            msg.position.z    = 20.5       
+            
+            msg.orientation.x = 0.0
+            msg.orientation.y = 0.0
+            msg.orientation.z = float(qz)
+            msg.orientation.w = float(qw)
+            
+            self.teleport_pub.publish(msg)
+
+            # Wait for Unity to confirm
+            arrived = self.commander.wait_for_unity_arrival(timeout=10.0)
+            if not arrived:
+                self._logger.warn("⚠️ BT: Teleport arrival timeout — assuming success")
 
             # Clear this obstacle
             self.obstacles.remove(obstacle)
@@ -870,19 +895,19 @@ class BTOrchestrator(Node):
 
             # --- rope_start ---
             self._make_nav_with_obstacle_check(
-                wp["rope_start"], f"S{sid}_RopeStart"
+                wp["rope_start"], f"S{sid}_RopeStart", sid
             ),
             StartRope(self.commander, log),
 
             # --- preamp ---
             self._make_nav_with_obstacle_check(
-                wp["preamp"], f"S{sid}_Preamp"
+                wp["preamp"], f"S{sid}_Preamp", sid
             ),
             PickAndPlace(self.commander, self.debug_mode, log),
 
             # --- rope_end ---
             self._make_nav_with_obstacle_check(
-                wp["rope_end"], f"S{sid}_RopeEnd"
+                wp["rope_end"], f"S{sid}_RopeEnd", sid
             ),
             StopRope(sid, self.commander, self.site_pub, log),
 
@@ -901,7 +926,7 @@ class BTOrchestrator(Node):
         )
 
     def _make_nav_with_obstacle_check(
-        self, waypoint: list, label: str
+        self, waypoint: list, label: str, site_id: int
     ) -> py_trees.behaviour.Behaviour:
         """Wrap a GoToWaypoint in a pre-navigation obstacle check.
 
@@ -926,7 +951,7 @@ class BTOrchestrator(Node):
                 ),
                 AvoidObstacle(
                     self.obstacles, self.commander,
-                    self.curved_goal_pub, log,
+                    self.teleport_pub, log, self, site_id
                 ),
             ],
         )
