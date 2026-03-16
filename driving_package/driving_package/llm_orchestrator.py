@@ -385,6 +385,7 @@ class LLMOrchestrator(Node):
         self.mission_active = False
         self.conversation_history = []
         self.rope_deploying = False  # Track rope state for LLM context
+        self._post_avoidance = False  # True for the first nav after go_around_obstacle
         
         # Progress tracking
         self.current_site_id = None  # Which site we're working on
@@ -575,8 +576,6 @@ class LLMOrchestrator(Node):
         rover_x   = rover_pos[0]
 
         # Proximity pre-check: if already within stopDistance of target, skip.
-        # Without this, SetLineGoal derives heading from a tiny backwards vector on
-        # retries (e.g. dz=-0.13m) and sends the rover driving the wrong direction.
         dist_xz = math.sqrt((rover_pos[0] - x) ** 2 + (rover_pos[2] - z) ** 2)
         if dist_xz < 0.5:
             self.get_logger().info(
@@ -594,7 +593,7 @@ class LLMOrchestrator(Node):
         behind = []
         for obs in self.current_obstacles:
             obs_x = obs['x']
-            radius = obs.get('radius', 1.0)
+            radius = obs.get('radius', 3.0)
             # Obstacle is "in the path" if it's between rover and target along X
             # (with radius buffer on both sides)
             min_x = min(rover_x, x)
@@ -628,7 +627,23 @@ class LLMOrchestrator(Node):
             })
         
         try:
-            success = self.commander.go_to_site(x, y, z)
+            # The first navigate_to_waypoint call immediately after go_around_obstacle
+            # uses the Bezier follower (curved_goal). The line follower oscillates on
+            # short ~5 m post-avoidance segments because the rover enters with ~14°
+            # heading error that doesn't damp before the endpoint is reached.
+            # Subsequent navigation (longer segments at row-aligned waypoints) stays as
+            # fast SetLineGoal, matching the BT's GoToWaypoint behaviour exactly.
+            if self._post_avoidance:
+                self._post_avoidance = False
+                row_config = DEPLOYMENT_ROWS[self.current_row]
+                travel_heading = row_config["heading"]  # 90° for +X, 270° for −X
+                self.get_logger().info(
+                    f"📍 [POST-AVOIDANCE] Using Bezier for stable approach to ({x}, {y}, {z})"
+                )
+                self._publish_curved_goal(x, y, z, travel_heading, is_final=True)
+                success = self.commander.wait_for_unity_arrival(timeout=60.0, target=(x, y, z))
+            else:
+                success = self.commander.go_to_site(x, y, z)
             # Track step progress based on which waypoint this likely is
             if self.current_site_id and self.current_step in (1, 2):
                 self.current_step = 2  # Completed rope_start nav
@@ -933,8 +948,8 @@ class LLMOrchestrator(Node):
                 "remaining_obstacles": len(self.current_obstacles)
             })
         
-        radius = obstacle.get('radius', 1.0)
-        offset = 5.0  # meters to swerve sideways
+        radius = obstacle.get('radius', 3.0)
+        offset = 3.0  # meters to swerve sideways — matches BT AvoidObstacle.SWERVE_OFFSET
         
         # Swerve direction: left = -Z, right = +Z in Unity
         if direction == "right":
@@ -962,10 +977,10 @@ class LLMOrchestrator(Node):
         
         # === Curve 2: avoidance point → rejoin original line past obstacle ===
         rejoin_x = obs_x + d * (radius + 2.0)  # Past the obstacle in travel direction
-        rejoin_z = row_config["z"]  # Snap back to the row's centerline Z, not the obstacle's Z
+        rejoin_z = obs_z  # Rejoin at the rock's original Z (matches BT behaviour)
         
         self.get_logger().info(f"   Curve 2: rejoin at ({rejoin_x}, {obs_y}, {rejoin_z})")
-        self._publish_curved_goal(rejoin_x, obs_y, rejoin_z, travel_heading, is_final=True)  # Final  snap to travel heading on arrival (mirrors BT AvoidObstacle) — skip heading alignment, next navigate_to_waypoint handles it
+        self._publish_curved_goal(rejoin_x, obs_y, rejoin_z, travel_heading, is_final=True)
         arrived2 = self.commander.wait_for_unity_arrival(timeout=30.0)
         
         if not arrived2:
@@ -973,6 +988,11 @@ class LLMOrchestrator(Node):
         
         # Mark obstacle as cleared
         self.current_obstacles.remove(obstacle)
+        
+        # Signal that the NEXT navigate_to_waypoint should use Bezier (stable on short
+        # post-avoidance segments) instead of the line follower (which oscillates when
+        # the rover enters with residual heading error on a ~5 m segment).
+        self._post_avoidance = True
         
         return json.dumps({
             "success": True,
@@ -1168,6 +1188,13 @@ class LLMOrchestrator(Node):
         """Pause the mission and hand control to a human operator via the terminal."""
         self.get_logger().info(f"🛑 LLM requested: request_operator_control(reason='{reason}')")
 
+        # ── Stop rope if it is still deploying — must not run during manual control ──
+        rope_was_deploying = self.rope_deploying
+        if rope_was_deploying:
+            self.commander.set_rope(False)
+            self.rope_deploying = False
+            self.get_logger().info("🪢 Rope stopped before handing control to operator")
+
         # ── Release autonomous control so the operator/Unity can drive the rover ──
         from std_msgs.msg import Bool as BoolMsg
         self.commander.pub_aut.publish(BoolMsg(data=False))
@@ -1205,7 +1232,14 @@ class LLMOrchestrator(Node):
             "success": True,
             "message": "Operator has returned control to the LLM. Autonomous mode re-enabled.",
             "operator_notes": operator_notes if operator_notes else "(no notes provided)",
-            "instruction": "Re-assess the current situation using the operator's notes, then continue the mission."
+            "rope_was_stopped": rope_was_deploying,
+            "rope_deploying": False,
+            "instruction": (
+                "Re-assess the current situation using the operator's notes, then continue the mission. "
+                + ("Rope was stopped automatically before operator hand-off — the current site is effectively aborted. "
+                   "Call abort_site() to log it, then go_around_obstacle() if an obstacle is still ahead, "
+                   "then continue to the next site." if rope_was_deploying else "")
+            ).strip()
         })
 
     def execute_tool(self, tool_name: str, arguments: dict) -> str:
