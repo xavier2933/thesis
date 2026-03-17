@@ -934,7 +934,7 @@ class LLMOrchestrator(Node):
             })
         
         radius = obstacle.get('radius', 1.0)
-        offset = 5.0  # meters to swerve sideways
+        offset = 3.0  # meters to swerve sideways
         
         # Swerve direction: left = -Z, right = +Z in Unity
         if direction == "right":
