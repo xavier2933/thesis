@@ -26,6 +26,8 @@ from openai import OpenAI
 
 # Directory to save conversation logs
 LOG_DIR = os.path.expanduser("~/thesis_ws/llm_logs")
+MAX_HISTORY_MESSAGES = 15  # tune this
+
 
 # ============================================================================
 # MISSION CONFIGURATION
@@ -204,8 +206,29 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_adjusted_site_waypoints",
-            "description": "Get the waypoints for a site, automatically adjusted if the rover has overshot the rope_start position. Call this BEFORE starting each site to get the correct coordinates. If the rover is past rope_start, all waypoints are shifted forward by the same offset to maintain spacing. If the rover is past rope_end, the site is marked as skipped.",
+            "name": "ignore_obstacle",
+            "description": "Call this to ignore an obstacle if you determine it is safely off the rover's path (based on Z coordinate difference and rover width). This will remove it from the tracked obstacles so you can proceed safely without going around.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "obstacle_id": {
+                        "type": "integer",
+                        "description": "The ID of the obstacle to ignore"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why you believe it is safe to ignore (e.g. 'Z coordinate difference is > 2m, path is safe')"
+                    }
+                },
+                "required": ["obstacle_id", "reason"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_site_waypoints",
+            "description": "Get the fixed waypoints for a site. Call this BEFORE starting each site to get the correct coordinates.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -283,7 +306,7 @@ Deploy antennas at {{total_sites}} sites across {{total_rows}} rows in an S-patt
 After completing all sites in a row, call turn_around() to move to the next row.
 
 DEPLOYMENT SEQUENCE (for each site):
-1. get_adjusted_site_waypoints(site_id) — get waypoints (auto-adjusts if rover overshot start)
+1. get_site_waypoints(site_id)          — get fixed waypoints for the site
 2. navigate_to_waypoint(rope_start)     — drive to the rope start position
 3. start_rope()                         — begin deploying rope
 4. navigate_to_waypoint(preamp)         — drive to the preamp position (while laying rope)
@@ -323,23 +346,25 @@ CURRENT OBSTACLES:
 
 RULES:
 - Deploy sites in the order listed for each row
-- navigate_to_waypoint will REFUSE to navigate if an obstacle is in the path — you MUST call go_around_obstacle first to clear it
+- navigate_to_waypoint will REFUSE to navigate if an obstacle is detected ahead in X — you MUST call ignore_obstacle (if Z is safe) or go_around_obstacle first to clear it
 - "Ahead" and "behind" depend on travel direction: in +X rows, ahead = higher X; in -X rows, ahead = lower X
 - When avoiding obstacles, choose left or right based on clearance
 - NEVER navigate backwards relative to your current travel direction
-- After avoiding an obstacle, the path is clear — continue with the deployment
+- After avoiding or ignoring an obstacle, the path is clear — continue with the deployment
 - After completing all sites in a row, call turn_around() before starting the next row
 - After completing all rows (or aborting), call mission_complete
 
 OBSTACLE AVOIDANCE FLOW (when not deploying rope):
-1. go_around_obstacle(obstacle_id, direction) — navigate around it
-2. Continue to your target waypoint with navigate_to_waypoint
+1. Evaluate obstacle position relative to rover path. If safe, call ignore_obstacle(obstacle_id, reason).
+2. Otherwise, go_around_obstacle(obstacle_id, direction) — navigate around it
+3. Continue to your target waypoint with navigate_to_waypoint
 
 OBSTACLE AVOIDANCE FLOW (when deploying rope):
-1. abort_site(site_id, reason) — stops rope
-2. go_around_obstacle(obstacle_id, direction) — navigate around it
-3. get_adjusted_site_waypoints(next_site_id) — get shifted waypoints
-4. Continue deployment at the next site
+1. Evaluate obstacle position. If safe, call ignore_obstacle(obstacle_id, reason) and continue.
+2. If blocking: abort_site(site_id, reason) — stops rope
+3. go_around_obstacle(obstacle_id, direction) — navigate around it
+4. get_site_waypoints(next_site_id) — get waypoints for the next site
+5. Continue deployment at the next site
 
 HUMAN-IN-THE-LOOP:
 - Call request_operator_control(reason="...") whenever you are unsure about the right action.
@@ -393,7 +418,7 @@ class LLMOrchestrator(Node):
         self.travel_direction = DEPLOYMENT_ROWS[0]["direction"]  # +1 or -1
         self.step_names = [
             "",  # 0 = not started
-            "get_adjusted_site_waypoints",
+            "get_site_waypoints",
             "navigate_to_waypoint(rope_start)",
             "start_rope",
             "navigate_to_waypoint(preamp)",
@@ -434,6 +459,15 @@ class LLMOrchestrator(Node):
         self.get_logger().info(f"📁 Logs will be saved to: {LOG_DIR}")
         if self.debug_mode:
             self.get_logger().info("⚡ DEBUG MODE: arm operations will be skipped in RoverCommander")
+
+
+    def trim_history(self):
+        """Keep the conversation history from growing unbounded."""
+        if len(self.conversation_history) > MAX_HISTORY_MESSAGES:
+            # Always keep the initial user message
+            first = self.conversation_history[:1]
+            recent = self.conversation_history[-(MAX_HISTORY_MESSAGES - 1):]
+            self.conversation_history = first + recent
     
     def deployment_result_callback(self, msg: String):
         """Receive deployment validation result from Unity."""
@@ -609,16 +643,17 @@ class LLMOrchestrator(Node):
             self.get_logger().warn(
                 f"🚫 Navigation BLOCKED by obstacle id={obs['id']} "
                 f"at ({obs['x']}, {obs['y']}, {obs['z']}) — "
-                f"must call go_around_obstacle first"
+                f"must call go_around_obstacle or ignore_obstacle first"
             )
             return json.dumps({
                 "success": False,
                 "blocked": True,
                 "message": (
                     f"BLOCKED: Obstacle id={obs['id']} at ({obs['x']:.1f}, {obs['y']:.1f}, {obs['z']:.1f}) "
-                    f"(radius {obs.get('radius', 3.0)}m) is in the path between rover "
+                    f"(radius {obs.get('radius', 3.0)}m) is detected ahead between rover "
                     f"({rover_x:.1f}) and target ({x:.1f}). "
-                    f"You MUST call go_around_obstacle(obstacle_id={obs['id']}, direction=...) first."
+                    f"You MUST call ignore_obstacle(obstacle_id={obs['id']}, reason=...) if it's safely off the path (check Z axis offset), "
+                    f"OR go_around_obstacle(obstacle_id={obs['id']}, direction=...) if it is blocking."
                 ),
                 "blocking_obstacles": [
                     {"id": o['id'], "x": o['x'], "y": o['y'], "z": o['z'], "radius": o.get('radius', 3.0)}
@@ -653,7 +688,7 @@ class LLMOrchestrator(Node):
             
             warning = None
             if obstacles_ahead:
-                warning = f"AHEAD: {'; '.join(obstacles_ahead)}. Call go_around_obstacle before navigating further."
+                warning = f"AHEAD: {'; '.join(obstacles_ahead)}. Call ignore_obstacle (if safe) or go_around_obstacle before navigating further."
             elif obstacles_behind:
                 warning = f"{len(obstacles_behind)} obstacle(s) behind — no action needed."
             
@@ -781,70 +816,23 @@ class LLMOrchestrator(Node):
         return None
 
     
-    def tool_get_adjusted_site_waypoints(self, site_id: int) -> str:
-        """Get waypoints for a site, adjusted if rover overshot rope_start."""
-        self.get_logger().info(f"📐 LLM requested: get_adjusted_site_waypoints(site_id={site_id})")
+    def tool_get_site_waypoints(self, site_id: int) -> str:
+        """Get fixed waypoints for a site."""
+        self.get_logger().info(f"📐 LLM requested: get_site_waypoints(site_id={site_id})")
         
         if site_id < 1 or site_id > len(DEPLOYMENT_SITES):
             return json.dumps({"success": False, "error": f"Invalid site_id {site_id}"})
         
         site = DEPLOYMENT_SITES[site_id - 1]
         waypoints = site["waypoints"]
-        rover_x = self.commander.rover_position[0]
-        rope_start_x = waypoints["rope_start"][0]
-        rope_end_x = waypoints["rope_end"][0]
-        d = self.travel_direction  # +1 for +X, -1 for -X
         
-        # "Past rope_end" = rover overshot the end in the travel direction
-        # For +X: rover_x > rope_end_x.  For -X: rover_x < rope_end_x.
-        if d * rover_x > d * rope_end_x + 1.0:
-            self.get_logger().info(f"⏭️ Rover (X={rover_x:.1f}) past rope_end (X={rope_end_x:.1f}) — skipping site {site_id}")
-            self.aborted_sites.append({"site_id": site_id, "reason": "rover overshot entire site"})
-            return json.dumps({
-                "success": False,
-                "skipped": True,
-                "message": f"Site {site_id} skipped — rover is past rope_end. Move to next site.",
-                "rover_x": rover_x,
-                "rope_end_x": rope_end_x
-            })
-        
-        # "Past rope_start" = rover overshot the start in the travel direction.
-        # Threshold is 0.0: any forward overshoot triggers adjustment so the LLM
-        # never navigates backwards.
-        if d * rover_x > d * rope_start_x + 0.0:
-            # Mirror the BT GoToWaypoint skip pattern: skip behind-rover waypoints so
-            # the next navigate call always goes FORWARD (+X).
-            # Key fix: use rover's actual Z (not the original row Z=255.0) and place
-            # rope_start 0.5 m ahead of rover so SetLineGoal derives heading ~90° (+X),
-            # not ~0° (+Z) which happened when rover_x == target_x but Z differed.
-            rover_z = self.commander.rover_position[2]
-            new_rs_x = rover_x + d * 0.5   # half-metre ahead guarantees forward heading
-            adjusted = {
-                "rope_start": [new_rs_x,                 waypoints["rope_start"][1], rover_z],
-                "preamp":     [new_rs_x + d * PREAMP_DX, waypoints["preamp"][1],     rover_z],
-                "rope_end":   [new_rs_x + d * ROPE_DX,   waypoints["rope_end"][1],   rover_z],
-            }
-            offset = d * (new_rs_x - rope_start_x)
-            self.get_logger().info(f"📐 Adjusted waypoints for site {site_id} (offset {offset:+.1f}m, rover_z={rover_z:.2f}): {adjusted}")
-            self.current_site_id = site_id
-            self.current_step = 1
-            return json.dumps({
-                "success": True,
-                "adjusted": True,
-                "offset": offset,
-                "waypoints": adjusted,
-                "message": f"Waypoints anchored 0.5 m ahead of rover. navigate_to_waypoint(rope_start) will be in +X direction."
-            })
-        else:
-            # Normal — rover hasn't overshot rope_start
-            self.current_site_id = site_id
-            self.current_step = 1
-            return json.dumps({
-                "success": True,
-                "adjusted": False,
-                "waypoints": waypoints,
-                "message": f"Using original waypoints for site {site_id}"
-            })
+        self.current_site_id = site_id
+        self.current_step = 1
+        return json.dumps({
+            "success": True,
+            "waypoints": waypoints,
+            "message": f"Using original waypoints for site {site_id}"
+        })
     
     def tool_abort_site(self, site_id: int, reason: str) -> str:
         """Abort the current site deployment."""
@@ -925,6 +913,31 @@ class LLMOrchestrator(Node):
             "final_deployed_sites": self.deployed_sites
         })
     
+    def tool_ignore_obstacle(self, obstacle_id: int, reason: str) -> str:
+        """Let LLM ignore an obstacle safely off path."""
+        self.get_logger().info(f"🤔 LLM requested: ignore_obstacle(obstacle_id={obstacle_id}, reason='{reason}')")
+        
+        # Find the obstacle
+        obstacle = None
+        for o in self.current_obstacles:
+            if o["id"] == obstacle_id:
+                obstacle = o
+                break
+        
+        if not obstacle:
+            return json.dumps({
+                "success": False,
+                "error": f"No obstacle with id {obstacle_id} found"
+            })
+            
+        self.current_obstacles.remove(obstacle)
+        
+        return json.dumps({
+            "success": True,
+            "message": f"Obstacle id={obstacle_id} ignored. Reason: '{reason}'. Path is considered clear from it.",
+            "remaining_obstacles": len(self.current_obstacles)
+        })
+
     def tool_go_around_obstacle(self, obstacle_id: int, direction: str = "left") -> str:
         """Navigate around an obstacle using two Bezier curve goals."""
         self.get_logger().info(f"🪨 LLM requested: go_around_obstacle(obstacle_id={obstacle_id}, direction={direction})")
@@ -1252,13 +1265,18 @@ class LLMOrchestrator(Node):
             return self.tool_get_mission_status()
         elif tool_name == "mission_complete":
             return self.tool_mission_complete(arguments.get("summary", ""))
+        elif tool_name == "ignore_obstacle":
+            return self.tool_ignore_obstacle(
+                arguments["obstacle_id"],
+                arguments.get("reason", "unspecified")
+            )
         elif tool_name == "go_around_obstacle":
             return self.tool_go_around_obstacle(
                 arguments["obstacle_id"],
                 arguments.get("direction", "left")
             )
-        elif tool_name == "get_adjusted_site_waypoints":
-            return self.tool_get_adjusted_site_waypoints(arguments["site_id"])
+        elif tool_name == "get_site_waypoints":
+            return self.tool_get_site_waypoints(arguments["site_id"])
         elif tool_name == "abort_site":
             site_id = arguments.get("site_id") or self.current_site_id
             if site_id is None:
@@ -1341,6 +1359,7 @@ class LLMOrchestrator(Node):
         
         while self.mission_active and iteration < max_iterations:
             iteration += 1
+            self.trim_history() 
             self.get_logger().info(f"\n--- ReAct Iteration {iteration} ---")
             
             # Call LLM with current conversation + tools (retry on rate limit)
