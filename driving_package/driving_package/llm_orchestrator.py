@@ -1234,6 +1234,12 @@ class LLMOrchestrator(Node):
         """Pause the mission and hand control to a human operator via the terminal."""
         self.get_logger().info(f"🛑 LLM requested: request_operator_control(reason='{reason}')")
 
+        # Remember if rope was deploying, and stop it while paused
+        was_deploying = self.rope_deploying
+        if was_deploying:
+            self.commander.set_rope(False)
+            self.get_logger().info("🪢 Paused rope deployment for operator intervention")
+
         # ── Release autonomous control so the operator/Unity can drive the rover ──
         from std_msgs.msg import Bool as BoolMsg
         self.commander.pub_aut.publish(BoolMsg(data=False))
@@ -1247,6 +1253,10 @@ class LLMOrchestrator(Node):
         print("─" * 54)
         print("Rover is PAUSED. Autonomous mode DISABLED.")
         print("You now have full manual control of the rover.")
+        
+        if was_deploying:
+            print("⚠️ NOTE: Rope deployment is temporarily paused. It will resume automatically.")
+            
         print("")
         print("When finished, press ENTER (optionally describe what you did):")
 
@@ -1258,6 +1268,10 @@ class LLMOrchestrator(Node):
         # ── Reclaim autonomous control ──
         self.commander.pub_aut.publish(BoolMsg(data=True))
         self.get_logger().info("📡 Published autonomous_mode=True — LLM has control again")
+
+        if was_deploying:
+            self.commander.set_rope(True)
+            self.get_logger().info("🪢 Resumed rope deployment after operator intervention")
 
         print(f"{banner}")
         print("✅ Operator released control. Autonomous mode RESTORED. Resuming LLM mission...")
