@@ -253,11 +253,15 @@ class SiteReachable(py_trees.behaviour.Behaviour):
 # ============================================================================
 
 class ObstacleAhead(py_trees.behaviour.Behaviour):
-    """Condition: SUCCESS if an obstacle is ahead of the rover.
+    """Condition: SUCCESS if a BLOCKING obstacle is ahead of the rover.
 
-    "Ahead" means obstacle_x > rover_x - 2.0  (same logic as the LLM
-    orchestrator).  The node does NOT consume/remove the obstacle.
+    "Ahead" means obstacle_x > rover_x - 2.0. 
+    "Blocking" means the obstacle's Z coordinate is within the rover's 
+    path width (plus a safety buffer). Safely offset obstacles are ignored.
     """
+
+    # Rover is 1.5m wide (0.75m half-width). Added 0.75m safety buffer.
+    SAFE_Z_MARGIN = 1.5
 
     def __init__(self, obstacles: list, commander: RoverCommander, logger):
         super().__init__("ObstacleAhead?")
@@ -267,13 +271,32 @@ class ObstacleAhead(py_trees.behaviour.Behaviour):
 
     def update(self):
         rover_x = self.commander.rover_position[0]
-        for obs in self.obstacles:
+        rover_z = self.commander.rover_position[2]
+        
+        # Iterate over a copy since we might modify the list
+        for obs in list(self.obstacles):
+            # Check if it is ahead of us along the X-axis
             if obs["x"] > rover_x - 2.0:
-                self._logger.info(
-                    f"🪨 BT: Obstacle id={obs['id']} ahead "
-                    f"at ({obs['x']}, {obs['y']}, {obs['z']})"
-                )
-                return py_trees.common.Status.SUCCESS
+                
+                # Check cross-track (Z) clearance
+                z_offset = abs(obs["z"] - rover_z)
+                
+                if z_offset > self.SAFE_Z_MARGIN:
+                    self._logger.info(
+                        f"⏭️ BT: Obstacle id={obs['id']} is ahead but safely "
+                        f"off-path in Z (dz={z_offset:.1f}m > {self.SAFE_Z_MARGIN}m). Ignoring."
+                    )
+                    # It's safe! Remove it from tracking so we don't keep evaluating it
+                    self.obstacles.remove(obs)
+                    continue
+                else:
+                    self._logger.info(
+                        f"🪨 BT: BLOCKING Obstacle id={obs['id']} ahead "
+                        f"at ({obs['x']:.1f}, {obs['y']:.1f}, {obs['z']:.1f}) (dz={z_offset:.1f}m)"
+                    )
+                    # It's blocking! Trigger the AvoidObstacle maneuver
+                    return py_trees.common.Status.SUCCESS
+                    
         return py_trees.common.Status.FAILURE
 
 
@@ -290,12 +313,13 @@ class AvoidObstacle(py_trees.behaviour.Behaviour):
     TRAVEL_HEADING = 90.0  # degrees, +X axis
 
     def __init__(self, obstacles: list, commander: RoverCommander,
-                 curved_goal_pub, logger):
+                 curved_goal_pub, logger, orchestrator=None):
         super().__init__("AvoidObstacle")
         self.obstacles = obstacles
         self.commander = commander
         self.curved_goal_pub = curved_goal_pub
         self._logger = logger
+        self.orchestrator = orchestrator
 
         self._thread = None
         self._success = None
@@ -368,9 +392,16 @@ class AvoidObstacle(py_trees.behaviour.Behaviour):
             self.commander.wait_for_unity_arrival(timeout=30.0)
 
             # Curve 2: rejoin original line past obstacle
+            # Snap back to the row's centerline Z (not the obstacle's Z),
+            # mirroring LLMOrchestrator.tool_go_around_obstacle().
+            if self.orchestrator is not None:
+                row_config = DEPLOYMENT_ROWS[self.orchestrator.current_row]
+                rejoin_z = row_config["z"]
+            else:
+                rejoin_z = obs_z  # fallback: keep old behaviour
             rejoin_x = obs_x + radius + 2.0
             self._publish_curved_goal(
-                rejoin_x, obs_y, obs_z, self.TRAVEL_HEADING, is_final=True
+                rejoin_x, obs_y, rejoin_z, self.TRAVEL_HEADING, is_final=True
             )
             self.commander.wait_for_unity_arrival(timeout=30.0)
 
@@ -927,6 +958,7 @@ class BTOrchestrator(Node):
                 AvoidObstacle(
                     self.obstacles, self.commander,
                     self.curved_goal_pub, log,
+                    orchestrator=self,
                 ),
             ],
         )
