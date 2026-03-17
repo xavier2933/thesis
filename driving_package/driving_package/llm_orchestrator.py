@@ -623,6 +623,20 @@ class LLMOrchestrator(Node):
                 "warning": None
             })
 
+        # Skip backward navigation: if the target is already behind the rover
+        # in the travel direction, don't reverse — just treat it as arrived.
+        d = self.travel_direction
+        if d * rover_x > d * x + 1.0:
+            self.get_logger().info(
+                f"⏭️ LLM: target (X={x:.1f}) is behind rover (X={rover_x:.1f}) in travel direction — skipping backwards nav"
+            )
+            return json.dumps({
+                "success": True,
+                "message": f"Target (X={x:.1f}) is >1m behind the rover (X={rover_x:.1f}). Navigation skipped automatically to prevent reversing course. Proceed to next step.",
+                "rover_position": list(rover_pos),
+                "warning": None
+            })
+
         # Pre-navigation obstacle check: refuse if obstacle is in the path
         blocking = []
         behind = []
@@ -825,13 +839,29 @@ class LLMOrchestrator(Node):
         
         site = DEPLOYMENT_SITES[site_id - 1]
         waypoints = site["waypoints"]
+        rover_x = self.commander.rover_position[0]
+        rope_end_x = waypoints["rope_end"][0]
+        d = self.travel_direction  # +1 for +X, -1 for -X
         
+        # "Past rope_end" = rover overshot the end in the travel direction
+        # For +X: rover_x > rope_end_x.  For -X: rover_x < rope_end_x.
+        if d * rover_x > d * rope_end_x + 1.0:
+            self.get_logger().info(f"⏭️ Rover (X={rover_x:.1f}) past rope_end (X={rope_end_x:.1f}) — skipping site {site_id}")
+            self.aborted_sites.append({"site_id": site_id, "reason": "rover overshot entire site"})
+            return json.dumps({
+                "success": False,
+                "skipped": True,
+                "message": f"Site {site_id} skipped — rover is past rope_end. Move to next site.",
+                "rover_x": rover_x,
+                "rope_end_x": rope_end_x
+            })
+            
         self.current_site_id = site_id
         self.current_step = 1
         return json.dumps({
             "success": True,
             "waypoints": waypoints,
-            "message": f"Using original waypoints for site {site_id}"
+            "message": f"Using original waypoints for site {site_id}. Reminder: if a waypoint is behind the rover, it will be skipped automatically during navigate_to_waypoint."
         })
     
     def tool_abort_site(self, site_id: int, reason: str) -> str:
