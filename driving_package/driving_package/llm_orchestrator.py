@@ -894,6 +894,29 @@ class LLMOrchestrator(Node):
     def tool_mission_complete(self, summary: str) -> str:
         """Mark mission as complete."""
         self.get_logger().info(f"🏁 LLM requested: mission_complete(summary='{summary}')")
+
+        # Guard: refuse to complete if there are still unhandled sites.
+        # This prevents the LLM from hallucinating mission completion when sites
+        # are pending — a consistent failure mode at high iteration counts.
+        aborted_ids = [s["site_id"] for s in self.aborted_sites]
+        pending = [
+            s["site_id"] for s in DEPLOYMENT_SITES
+            if s["site_id"] not in self.deployed_sites
+            and s["site_id"] not in aborted_ids
+        ]
+        if pending:
+            self.get_logger().warn(
+                f"⚠️ mission_complete called but sites {pending} are still pending!"
+            )
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"Cannot mark mission complete — sites {pending} are still pending. "
+                    f"You must deploy or abort all remaining sites first. "
+                    f"Deployed: {self.deployed_sites}, Aborted: {aborted_ids}."
+                )
+            })
+
         self.mission_active = False
         return json.dumps({
             "success": True,
