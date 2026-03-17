@@ -1422,7 +1422,7 @@ class LLMOrchestrator(Node):
                 except Exception as api_err:
                     from openai import RateLimitError
                     if isinstance(api_err, RateLimitError) and _attempt < 4:
-                        wait = 2 ** (_attempt + 1)  # 2, 4, 8, 16, 32 s
+                        wait = _attempt + 2  # 2, 3, 4, 5 s instead of exponential backoff
                         self.get_logger().warn(
                             f"[RATE LIMIT] 429 on iteration {iteration} "
                             f"(attempt {_attempt+1}/5) — retrying in {wait}s"
