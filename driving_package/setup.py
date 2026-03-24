@@ -27,6 +27,7 @@ setup(
             'orchestrate_deployment = driving_package.orchestrate_deployment:main',
             'llm_orchestrator = driving_package.llm_orchestrator:main',
             'bt_orchestrator = driving_package.bt_orchestrator:main',
+            'arm_pick_place_test = driving_package.arm_pick_place_test:main',
         ],
     },
 )
