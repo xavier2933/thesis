@@ -1,0 +1,17 @@
+digraph pastafarianism {
+ordering=out;
+graph [fontname="times-roman"];
+node [fontname="times-roman"];
+edge [fontname="times-roman"];
+Mission [fillcolor=orange, fontcolor=black, fontsize=9, label="Ⓜ Mission", shape=box, style=filled];
+"Drive to start" [fillcolor=gray, fontcolor=black, fontsize=9, label="Drive to start", shape=ellipse, style=filled];
+Mission -> "Drive to start";
+"Deploy antenna?" [fillcolor=cyan, fontcolor=black, fontsize=9, label="Ⓜ Deploy antenna?", shape=octagon, style=filled];
+Mission -> "Deploy antenna?";
+"Deploy antenna" [fillcolor=gray, fontcolor=black, fontsize=9, label="Deploy antenna", shape=ellipse, style=filled];
+"Deploy antenna?" -> "Deploy antenna";
+"Drive to end" [fillcolor=gray, fontcolor=black, fontsize=9, label="Drive to end", shape=ellipse, style=filled];
+"Deploy antenna?" -> "Drive to end";
+"Drive to end " [fillcolor=gray, fontcolor=black, fontsize=9, label="Drive to end ", shape=ellipse, style=filled];
+Mission -> "Drive to end ";
+}

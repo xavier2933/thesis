@@ -395,7 +395,7 @@ class LLMOrchestrator(Node):
         
         # Initialize OpenAI client
         self.client = OpenAI()
-        self.model = "gpt-5-nano"  # Can change to gpt-4o-mini for faster/cheaper
+        self.model = "gpt-5-mini"  # Can change to gpt-4o-mini for faster/cheaper
         
         # Initialize RoverCommander (pass debug_mode to skip arm operations)
         self.commander = RoverCommander(debug_mode=self.debug_mode)
